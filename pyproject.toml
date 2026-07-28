@@ -65,7 +65,16 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-ignore = ["B008"]
+# RUF022: __all__ is grouped by SPEC section with comments rather than sorted
+# alphabetically. The grouping is the documentation — it maps each export to the
+# section that mandates it — and alphabetizing would destroy that.
+ignore = ["B008", "RUF022"]
+
+[tool.ruff.lint.per-file-ignores]
+# UP042: RunPhase and ClaimState use `(str, Enum)` rather than `StrEnum`. Their
+# repr is depended upon by the conformance suite, and StrEnum changes `str(x)`
+# from "RunPhase.Failed" to "Failed". Held stable deliberately.
+"src/symphony/models.py" = ["UP042"]
 
 [tool.mypy]
 python_version = "3.11"

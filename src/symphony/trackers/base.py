@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from symphony.errors import TrackerResponseError, UnsupportedTrackerKind
@@ -202,10 +202,11 @@ def build_adapter(kind: str, provider: dict[str, Any], **kwargs: Any) -> Tracker
     """Construct the adapter for ``kind`` (SPEC 6.3 preflight uses this)."""
     cls = _REGISTRY.get(kind)
     if cls is None:
+        supported = adapter_kinds()
         raise UnsupportedTrackerKind(
-            f"unsupported tracker.kind {kind!r}; supported: {', '.join(adapter_kinds()) or '(none)'}",
+            f"unsupported tracker.kind {kind!r}; supported: {', '.join(supported) or '(none)'}",
             kind=kind,
-            supported=adapter_kinds(),
+            supported=supported,
         )
     return cls(provider, **kwargs)
 
@@ -226,7 +227,7 @@ def parse_rfc3339(value: Any) -> datetime | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
     if not isinstance(value, str) or not value.strip():
         return None
     try:
