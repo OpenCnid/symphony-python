@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "symphony-orchestrator"
+version = "0.1.0"
+description = "Symphony in Python — a conforming implementation of the openai/symphony SPEC.md, built RLM-native."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "OpenCnid" }]
+keywords = ["symphony", "codex", "orchestrator", "agents", "rlm", "recursive-language-model"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+]
+
+dependencies = [
+  "PyYAML>=6.0",
+  "python-liquid>=1.12",
+  "httpx>=0.27",
+  "watchfiles>=0.21",
+  "starlette>=0.37",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=5.0",
+  "anyio>=4.4",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+fast = ["uvloop>=0.19; sys_platform != 'win32'"]
+
+[project.scripts]
+symphony = "symphony.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/OpenCnid/symphony-python"
+Specification = "https://github.com/openai/symphony/blob/main/SPEC.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/symphony"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error::DeprecationWarning:symphony.*"]
+markers = [
+  "integration: Real Integration Profile (SPEC 17.8); requires credentials/network.",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["symphony"]
+strict = true
+warn_unreachable = true
