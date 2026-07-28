@@ -12,9 +12,11 @@ document explains how the owned pieces fit together.
 > **Verification basis.** Claims tagged **[verified]** were read against module
 > source in the working tree of `D:\symphony-python` on 2026-07-28, at which
 > point every path in the `CONTRACTS.md` ownership map existed and
-> `pytest` reported **1312 passed, 3 skipped in 111.07s** across 21 test files.
+> `pytest` reported **1315 passed, 3 skipped in 111.21s** across 21 test files.
 > The three skips are the SPEC 17.8 Real Integration Profile, which requires
-> credentials this host does not have.
+> credentials this host does not have. The tree was still being modified while
+> this document was written, so a module may have changed after the claim about
+> it was recorded.
 >
 > Claims tagged **[unverified]** could not be checked here — chiefly anything
 > requiring a running `codex` binary or a live tracker. §8 lists them, and
