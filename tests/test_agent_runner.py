@@ -546,7 +546,7 @@ async def test_failure_reraises_the_original_error_with_its_category(ws: Path) -
 
 
 async def test_session_lifecycle_logs_carry_issue_and_thread_context(ws: Path) -> None:
-    """SPEC 13.1 context fields; SPEC 4.2 keeps full session_id off this layer."""
+    """SPEC 13.1 context fields on the session-lifecycle log."""
     h = Harness(workspace_path=ws)
 
     await h.run()
@@ -556,7 +556,37 @@ async def test_session_lifecycle_logs_carry_issue_and_thread_context(ws: Path) -
     assert done["issue_identifier"] == "ENG-42"
     assert done["thread_id"] == "thread-1"
     assert done["outcome"] == "completed"
+
+
+async def test_session_id_is_bound_once_the_app_server_reports_it(ws: Path) -> None:
+    """SPEC 13.1 / 18.1 item 17 REQUIRE session_id on session-lifecycle logs.
+
+    SPEC 4.2 composes it as ``<thread_id>-<turn_id>`` and only the app-server
+    client sees ``turn_id``, so the runner learns it from the ``session_started``
+    payload rather than constructing it.
+    """
+    started = SimpleNamespace(
+        event="session_started",
+        payload={"thread_id": "thread-1", "turn_id": "turn-7", "session_id": "thread-1-turn-7"},
+    )
+    h = Harness(workspace_path=ws, events_per_turn={1: (started,)})
+
+    await h.run()
+
+    done = next(r for r in h.logger.records if r["msg"] == "agent attempt completed")
+    assert done["session_id"] == "thread-1-turn-7"
+    assert done["thread_id"] == "thread-1"
+
+
+async def test_session_id_is_omitted_rather_than_guessed_before_it_is_known(ws: Path) -> None:
+    """A wrong session_id is worse than an absent one (SPEC 4.2)."""
+    h = Harness(workspace_path=ws)  # no session_started event
+
+    await h.run()
+
+    done = next(r for r in h.logger.records if r["msg"] == "agent attempt completed")
     assert "session_id" not in done
+    assert done["thread_id"] == "thread-1"
 
 
 async def test_cancellation_still_stops_the_session_and_runs_after_run(ws: Path) -> None:
@@ -865,3 +895,35 @@ async def test_a_policy_swap_changes_what_the_runner_hands_the_client(ws: Path) 
         assert decider("thread/execCommandApproval", {"command": ["ls"]}).approved is False
     finally:
         set_approval_policy(previous)
+
+
+async def test_fail_run_decisions_survive_the_bridge_to_the_wire(ws: Path) -> None:
+    """SPEC 10.5: "fail the run" must not degrade into "deny and continue".
+
+    ``approvals`` models four outcomes; the app-server wire needs two. The
+    bridge must carry ``ends_run`` across, because a plain denial leaves the
+    agent free to re-request forever and nothing else in the system bounds
+    that loop -- both the turn-silence timeout and the orchestrator stall
+    timeout are activity-based, and re-requesting is activity.
+    """
+    from symphony.agent.runner import _canonical_approval_decider
+
+    verdict = _canonical_approval_decider(
+        "thread/execCommandApproval",
+        {"command": ["rm", "-rf", "/"], "name": "elicitUserChoice"},
+    )
+
+    assert verdict.approved is False
+    assert verdict.ends_run is True
+
+
+async def test_ordinary_approvals_do_not_end_the_run(ws: Path) -> None:
+    from symphony.agent.runner import _canonical_approval_decider
+
+    for method, params in (
+        ("thread/execCommandApproval", {"command": ["ls"]}),
+        ("thread/applyPatchApproval", {"changes": {}}),
+    ):
+        verdict = _canonical_approval_decider(method, params)
+        assert verdict.approved is True, method
+        assert verdict.ends_run is False, method

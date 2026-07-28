@@ -305,9 +305,23 @@ def test_dollar_var_indirection_declares_the_referenced_name(
     assert adapter.secret_environment_names() == ["BOARD_TOKEN"]
 
 
-def test_literal_token_declares_no_environment_name() -> None:
+def test_literal_token_still_declares_the_default_env_name() -> None:
+    """SPEC 15.3 is about what the *child* can read, not what the adapter used.
+
+    ``GITHUB_TOKEN`` is set host-side by the ``gh`` CLI and by every CI runner
+    regardless of what ``WORKFLOW.md`` says. Declaring nothing because this
+    adapter happened to use a literal would leave that host token readable by
+    the coding agent.
+    """
     adapter = GitHubProjectsAdapter({"owner": OWNER, "project_number": PROJECT, "token": TOKEN})
-    assert adapter.secret_environment_names() == []
+    assert adapter.secret_environment_names() == ["GITHUB_TOKEN"]
+
+
+def test_literal_token_declares_the_configured_env_name_when_overridden() -> None:
+    adapter = GitHubProjectsAdapter(
+        {"owner": OWNER, "project_number": PROJECT, "token": TOKEN, "token_env": "GH_BOARD_PAT"}
+    )
+    assert adapter.secret_environment_names() == ["GH_BOARD_PAT"]
 
 
 def test_empty_dollar_var_is_a_missing_secret_and_never_echoes_the_value(

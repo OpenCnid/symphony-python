@@ -233,14 +233,43 @@ def test_launch_cwd_rejects_a_child_of_the_workspace(root: Path) -> None:
 def test_path_for_is_deterministic_and_a_direct_child_of_root(manager: WorkspaceManager) -> None:
     first = manager.path_for("ENG-42")
     assert first == manager.path_for("ENG-42")
-    assert first == manager.root / "ENG-42"
+    assert first == manager.root / workspace_key("ENG-42")
     assert first.parent == manager.root
 
 
-def test_path_for_keeps_plain_key_when_sanitization_changes_nothing(
+def test_path_for_keeps_plain_key_when_nothing_could_collide(
     manager: WorkspaceManager,
 ) -> None:
-    assert manager.path_for("ENG-42").name == "ENG-42"
+    """A key needing neither sanitization nor case-fold protection stays readable."""
+    assert manager.path_for("eng-42").name == "eng-42"
+
+
+def test_case_variant_identifiers_get_distinct_workspaces(
+    manager: WorkspaceManager,
+) -> None:
+    """SPEC 9.5 Invariant 3 on a case-insensitive filesystem.
+
+    Sanitization is not the last normalizer between an identifier and a
+    directory: Windows and macOS fold case. Without the hash suffix, ``ENG-42``
+    and ``eng-42`` produce two distinct keys that resolve to one directory,
+    putting two coding agents in one workspace.
+    """
+    upper = manager.path_for("ENG-42")
+    lower = manager.path_for("eng-42")
+
+    assert upper != lower
+    assert os.path.normcase(str(upper)) != os.path.normcase(str(lower))
+    assert upper.parent == manager.root and lower.parent == manager.root
+
+
+def test_trailing_dot_identifiers_get_distinct_workspaces(
+    manager: WorkspaceManager,
+) -> None:
+    """Windows strips trailing dots and spaces from directory names."""
+    keys = {manager.path_for(i).name for i in ("eng-1", "eng-1.", "eng-1...", "eng-1 ")}
+    folded = {os.path.normcase(k).rstrip(". ") for k in keys}
+
+    assert len(folded) == 4, f"identifiers collapsed onto one directory: {folded}"
 
 
 def test_path_for_distinguishes_identifiers_that_sanitize_alike(
@@ -276,7 +305,7 @@ def test_path_for_rejects_a_workspace_symlinked_out_of_root(
 ) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
-    (manager.root / "ENG-1").symlink_to(outside, target_is_directory=True)
+    manager.path_for("ENG-1").symlink_to(outside, target_is_directory=True)
     with pytest.raises(WorkspacePathEscapesRoot):
         manager.path_for("ENG-1")
 
@@ -292,10 +321,10 @@ async def test_create_makes_the_missing_directory(
     ws = await manager.create_for_issue("ENG-1")
 
     assert ws.created_now is True
-    assert ws.workspace_key == "ENG-1"
+    assert ws.workspace_key == workspace_key("ENG-1")
     assert Path(ws.path).is_absolute()
     assert Path(ws.path).is_dir()
-    assert Path(ws.path) == manager.root / "ENG-1"
+    assert Path(ws.path) == manager.path_for("ENG-1")
     assert hooks.names == ["after_create"]
 
 
@@ -425,7 +454,7 @@ async def test_non_directory_at_the_workspace_path_fails_and_is_not_unlinked(
     manager: WorkspaceManager, hooks: FakeHookRunner
 ) -> None:
     """Documented policy (SPEC 17.2, CONTRACTS section 5): fail, never unlink."""
-    occupied = manager.root / "ENG-1"
+    occupied = manager.path_for("ENG-1")
     occupied.write_text("not a workspace", encoding="utf-8")
 
     with pytest.raises(WorkspaceCreationError):
@@ -493,7 +522,7 @@ async def test_cleanup_ignores_a_before_remove_failure(root: Path) -> None:
 async def test_cleanup_refuses_to_unlink_a_non_directory(
     manager: WorkspaceManager, hooks: FakeHookRunner
 ) -> None:
-    occupied = manager.root / "ENG-1"
+    occupied = manager.path_for("ENG-1")
     occupied.write_text("not a workspace", encoding="utf-8")
 
     with pytest.raises(WorkspaceError):
@@ -510,7 +539,7 @@ async def test_cleanup_refuses_to_follow_a_symlinked_workspace(
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "precious.txt").write_text("keep me", encoding="utf-8")
-    (manager.root / "ENG-1").symlink_to(outside, target_is_directory=True)
+    manager.path_for("ENG-1").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(WorkspacePathEscapesRoot):
         await manager.cleanup("ENG-1")

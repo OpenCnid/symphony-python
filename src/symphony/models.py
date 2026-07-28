@@ -64,22 +64,45 @@ def normalize_label(label: str | None) -> str:
     return (label or "").strip().lower()
 
 
+def _folds_ambiguously(key: str) -> bool:
+    """True when a filesystem could collapse this key onto a different one.
+
+    Sanitization is not the only normalizer standing between an identifier and
+    a directory. Windows and macOS fold case, and Windows additionally strips
+    trailing dots and spaces — so ``ENG-42`` and ``eng-42`` sanitize to two
+    distinct keys and then resolve to one directory, putting two coding agents
+    in one workspace. SPEC 4.2 mandates the hash suffix only on sanitization
+    change because it is written POSIX-first; SPEC 9.5 Invariant 3's actual
+    requirement is collision resistance, which needs this second check too.
+    """
+    if key != key.casefold():
+        return True
+    # Trailing dots/spaces only fold when something remains to fold onto.
+    # `.` and `..` are left alone deliberately: they must keep reaching the
+    # SPEC 9.5 Invariant 2 containment check, which rejects them. Giving them
+    # a hash suffix would turn them into ordinary contained directories and
+    # silently retire that guard.
+    stripped = key.rstrip(". ")
+    return bool(stripped) and stripped != key
+
+
 def workspace_key(identifier: str) -> str:
     """Derive a collision-resistant workspace directory name (SPEC 4.2, 9.5).
 
-    Characters outside ``[A-Za-z0-9._-]`` are replaced with ``_``. When that
-    replacement changes the identifier, a stable 64-bit hash of the *original*
-    identifier is appended, so two distinct identifiers that sanitize to the
-    same text still receive distinct keys.
+    Characters outside ``[A-Za-z0-9._-]`` are replaced with ``_``. A stable
+    64-bit hash of the *original* identifier is appended whenever the plain
+    sanitized text cannot be trusted to be injective — either because
+    sanitization changed it, or because the host filesystem's own folding
+    could collapse it onto another key (see :func:`_folds_ambiguously`).
 
-    Identifiers unchanged by sanitization keep their plain deterministic key —
-    the hash suffix is added only when it is needed to preserve injectivity.
+    An identifier that survives both checks keeps its plain deterministic key,
+    so the common lowercase case stays readable on disk.
     """
     if not identifier:
         raise ValueError("issue identifier must be a non-empty string")
 
     sanitized = WORKSPACE_KEY_ALLOWED.sub("_", identifier)
-    if sanitized == identifier:
+    if sanitized == identifier and not _folds_ambiguously(sanitized):
         return sanitized
 
     digest = hashlib.blake2b(identifier.encode("utf-8"), digest_size=_HASH_BYTES).hexdigest()

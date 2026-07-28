@@ -464,6 +464,16 @@ class HookRunner:
 
     # -- public API --------------------------------------------------------
 
+    def apply_config(self, cfg: HookConfig) -> None:
+        """Adopt a reloaded ``HookConfig`` (SPEC 6.2).
+
+        SPEC 6.2 REQUIRES workspace hooks and ``hooks.timeout_ms`` to follow a
+        ``WORKFLOW.md`` change without a restart. A hook already executing keeps
+        the config it started under; the new one governs subsequent executions.
+        """
+        self._cfg = cfg
+        self._warned_bad_timeout = False
+
     async def run(self, name: str, cwd: Path, *, fatal: bool) -> None:
         """Run hook ``name`` in ``cwd`` (SPEC 9.4).
 

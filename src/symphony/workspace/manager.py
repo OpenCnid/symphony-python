@@ -41,6 +41,22 @@ class WorkspaceManager:
         self.root: Path = normalize_abs(root)
         self.hooks: HookRunner = hooks
 
+    def apply_root(self, root: Path) -> bool:
+        """Adopt a reloaded ``workspace.root`` (SPEC 6.2). Returns True if it moved.
+
+        Existing workspaces under the previous root are deliberately left
+        untouched: SPEC 9.1 preserves workspaces across runs, and silently
+        relocating or deleting live work on a config edit would be far worse
+        than leaving directories an operator can see and remove. Runs already
+        in flight keep the path they were launched with (SPEC 6.2 does not
+        require restarting in-flight sessions).
+        """
+        new_root = normalize_abs(root)
+        if new_root == self.root:
+            return False
+        self.root = new_root
+        return True
+
     def path_for(self, identifier: str) -> Path:
         """Deterministic absolute workspace path for *identifier* (SPEC 9.1, 9.5).
 

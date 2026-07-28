@@ -651,6 +651,13 @@ class ServiceHost:
             return
 
         self.config = config
+        # SPEC 6.2 / 18.1 item 4: the reload must reach *future runs*, not just
+        # the scheduler. The runner, hook runner, and workspace manager are
+        # built once at startup and outlive every attempt, so a reload that
+        # stops at the orchestrator leaves the prompt, codex settings, hooks,
+        # and workspace root frozen at their process-start values.
+        self._reapply_to_collaborators(config)
+
         if self.orchestrator is None:
             # The watch starts before the orchestrator exists (SPEC 16.1 order);
             # a change landing in that window is captured by config alone.
@@ -668,6 +675,42 @@ class ServiceHost:
             return
 
         self.log.info("workflow reloaded", outcome="completed")
+
+    def _reapply_to_collaborators(self, config: Any) -> None:
+        """Push a reloaded config into the long-lived collaborators (SPEC 6.2).
+
+        Each step is independently guarded: a collaborator that predates this
+        protocol, or one that raises, must not abort the reload for the others
+        or crash the service (SPEC 6.2, 14.2).
+        """
+        orch = self.orchestrator
+        if orch is None:
+            return
+
+        runner = getattr(orch, "runner", None)
+        workspaces = getattr(orch, "workspaces", None)
+        hooks = getattr(workspaces, "hooks", None)
+
+        targets: list[tuple[str, Any, Any]] = [
+            ("agent runner", runner, lambda t: t.apply_config(config, self.workflow)),
+            ("hook runner", hooks, lambda t: t.apply_config(config.hooks)),
+            ("workspace manager", workspaces, lambda t: t.apply_root(config.workspace_root)),
+        ]
+        for label, target, apply in targets:
+            if target is None:
+                continue
+            try:
+                apply(target)
+            except AttributeError:
+                self.log.debug("collaborator does not support reload", component=label)
+            except Exception as exc:
+                self.log.error(
+                    "collaborator reload failed",
+                    component=label,
+                    outcome="failed",
+                    reason=_reason(exc),
+                    category=_category(exc),
+                )
 
     # -- observability reads (SPEC 13.3, 13.7.2) -------------------------
 

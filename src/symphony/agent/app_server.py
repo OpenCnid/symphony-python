@@ -58,6 +58,7 @@ import asyncio
 import itertools
 import json
 import os
+import re
 import shutil
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -197,6 +198,11 @@ PROTOCOL = ProtocolNames()
 # SPEC 10.1 RECOMMENDED process setting: max line size 10 MB for safe buffering.
 MAX_LINE_BYTES = 10 * 1024 * 1024
 
+#: A POSIX shell name safe to interpolate into an ``unset -v`` prefix. Anything
+#: else is dropped rather than quoted — an adapter declaring a name that is not
+#: a shell identifier is a bug, not an escaping problem.
+_SHELL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 # JSON-RPC error code used when this client declines a server-initiated request.
 JSONRPC_REQUEST_FAILED = -32000
 
@@ -226,6 +232,12 @@ class ApprovalDecision:
 
     approved: bool
     reason: str = ""
+    #: The policy's verdict is that this run should end, not merely that the
+    #: request is denied. SPEC 10.5 lets an implementation "fail the run", and a
+    #: two-valued decision cannot express that -- denying and continuing leaves
+    #: an agent that will simply ask again, which is the indefinite stall the
+    #: requirement exists to prevent.
+    ends_run: bool = False
 
 
 ApprovalDecider = Callable[[str, Mapping[str, Any]], ApprovalDecision]
@@ -368,8 +380,25 @@ class AppServerClient:
         the bare name; see :func:`resolve_bash` for why that distinction is
         load-bearing on Windows. Raises :class:`CodexNotFound` if no ``bash``
         exists on PATH.
+
+        The command is prefixed with ``unset -v`` for every declared secret
+        name. Stripping the environment dictionary (:meth:`_child_env`) is not
+        sufficient on its own: SPEC 10.1 mandates ``-l``, which sources the
+        login profile *after* the strip, and exporting a tracker token from
+        ``~/.bash_profile`` is a normal way for one to be set in the first
+        place. Without this the profile silently restores exactly the
+        credential SPEC 15.3 requires the child not to inherit.
         """
-        return [resolve_bash(), "-lc", self.cfg.command]
+        return [resolve_bash(), "-lc", self._guarded_command()]
+
+    def _guarded_command(self) -> str:
+        """``codex.command`` prefixed with an unset for each declared secret."""
+        names = [n for n in self._secret_env_names if _SHELL_NAME_RE.fullmatch(n)]
+        if not names:
+            return self.cfg.command
+        # Runs after profile sourcing, before the agent. `-v` unsets variables
+        # only, and the whole prefix is inert when a name was never set.
+        return "unset -v " + " ".join(names) + "; " + self.cfg.command
 
     def stderr_tail(self) -> list[str]:
         """Recent diagnostic stderr lines, never parsed as protocol (SPEC 10.3)."""
@@ -777,8 +806,16 @@ class AppServerClient:
                 self._respond_approval(req_id, method, params)
             elif method == p.tool_call:
                 await self._respond_tool_call(req_id, params)
-            elif method == p.user_input:
+            elif method == p.user_input or self._looks_like_user_input(method, params):
                 # SPEC 10.5: never stall. Decline, then fail the turn.
+                #
+                # The classifier is consulted as well as the exact name because
+                # the ProtocolNames strings are unverified against a real Codex
+                # (see the constants block). If the deployed spelling differs,
+                # an exact-match-only branch would answer every request and let
+                # the agent ask forever -- both the turn-silence timeout and the
+                # orchestrator stall timeout are activity-based, and this loop
+                # is activity, so nothing else in the system would bound it.
                 self._send_error(req_id, "user input is not available in this deployment")
                 turn = self._turn
                 if turn is not None:
@@ -791,11 +828,38 @@ class AppServerClient:
         except Exception as exc:  # a stalled session is worse than a lost error
             self._send_error(req_id, f"client failed to handle {method}: {exc}")
 
+    def _looks_like_user_input(self, method: str, params: Mapping[str, Any]) -> bool:
+        """Would the SPEC 10.5 policy classify this request as user input?
+
+        Imported lazily so this module stays importable if ``approvals`` is
+        absent, and falls back to ``False`` rather than raising -- a classifier
+        problem must not become a transport problem.
+        """
+        try:
+            from symphony.agent.approvals import ApprovalKind, classify_approval
+        except Exception:  # pragma: no cover - approvals always ships
+            return False
+        request = {"method": method, **dict(params)}
+        try:
+            return classify_approval(request) is ApprovalKind.USER_INPUT
+        except Exception:  # pragma: no cover - classifier is total by contract
+            return False
+
     def _respond_approval(self, req_id: Any, method: str, params: dict[str, Any]) -> None:
         """SPEC 10.5 documented policy, applied without blocking the stream."""
         decision = self._decide_approval(method, params)
         value = self.protocol.approve_value if decision.approved else self.protocol.deny_value
         self._send_result(req_id, {self.protocol.f_decision: value})
+
+        if decision.ends_run:
+            # SPEC 10.5: the policy said "fail the run", not merely "deny".
+            # Answering and continuing would let the agent re-request forever.
+            turn = self._turn
+            if turn is not None:
+                turn.finish("input_required", {"method": method, "reason": decision.reason})
+            else:  # pragma: no cover - out-of-turn approval
+                self._emit("turn_input_required", {"method": method, "reason": decision.reason})
+            return
         if decision.approved:
             self._emit(
                 "approval_auto_approved",

@@ -253,7 +253,15 @@ def _canonical_approval_decider(method: str, params: Mapping[str, Any]) -> Any:
     request: dict[str, Any] = {"method": method}
     request.update(params)
     decision = decide_approval(request)
-    return WireDecision(approved=bool(decision.is_approval), reason=str(decision.value))
+    # `ends_run` is carried across, not discarded. `approvals` models four
+    # outcomes and the wire needs two, but collapsing them loses precisely the
+    # one SPEC 10.5 depends on: FAIL_RUN means end the run, and a plain denial
+    # leaves the agent free to ask again forever.
+    return WireDecision(
+        approved=bool(decision.is_approval),
+        reason=str(decision.value),
+        ends_run=bool(decision.ends_run),
+    )
 
 
 def _default_app_server_factory(
@@ -345,6 +353,10 @@ class _AttemptContext:
 
     issue: Issue
     turn_number: int = 1
+    #: SPEC 4.2 ``<thread_id>-<turn_id>``, learned from the ``session_started``
+    #: event because only the app-server client sees ``turn_id``. Required on
+    #: session-lifecycle logs by SPEC 13.1 / 18.1 item 17.
+    session_id: str | None = None
 
 
 class AgentRunner:
@@ -455,7 +467,7 @@ class AgentRunner:
                 workspace=workspace_path,
                 tool_specs=list(self._tracker.agent_tool_specs()),
                 tool_executor=self._make_tool_executor(ctx),
-                on_event=self._make_event_sink(issue.id, log),
+                on_event=self._make_event_sink(issue.id, log, ctx),
                 secret_env_names=tuple(self._tracker.secret_environment_names()),
                 approval_decider=_canonical_approval_decider,
             )
@@ -465,11 +477,14 @@ class AgentRunner:
             await self._run_after_run(workspace_path, log)
             raise
 
-        # SPEC 13.1 wants `session_id` on session-lifecycle logs, but SPEC 4.2
-        # defines it as "<thread_id>-<turn_id>" and only the app-server client
-        # sees `turn_id`. The runner logs the half it actually knows rather
-        # than emitting a field that would be wrong.
-        session_log = log.bind(thread_id=getattr(session, "thread_id", None))
+        # SPEC 13.1 / 18.1 item 17: session-lifecycle logs carry `session_id`.
+        # SPEC 4.2 composes it as "<thread_id>-<turn_id>", and only the
+        # app-server client sees `turn_id` -- so the sink harvests it from the
+        # `session_started` payload and `_session_logger` binds whatever is
+        # known at each call site. `thread_id` is carried alongside because it
+        # is stable across the continuation turns that change `session_id`.
+        thread_id = getattr(session, "thread_id", None)
+        session_log = self._session_logger(log, ctx, thread_id)
 
         # SPEC 16.5 exits 4-6 plus the four normal breaks. Wrapping the whole
         # loop is deliberate: it makes it structurally impossible for a new
@@ -485,7 +500,8 @@ class AgentRunner:
 
         await self._stop_session(session, session_log)
         await self._run_after_run(workspace_path, session_log)
-        session_log.info(
+        # Re-bind: session_id is only learned once the first turn starts.
+        self._session_logger(log, ctx, thread_id).info(
             "agent attempt completed",
             outcome="completed",
             reason=reason,
@@ -516,7 +532,11 @@ class AgentRunner:
         max_turns = self._config.max_turns
 
         while True:
-            turn_log = log.bind(turn=ctx.turn_number)
+            # Re-bind per turn: SPEC 4.2 makes session_id turn-scoped, so it
+            # changes on every continuation turn and is unknown before the
+            # first one starts (SPEC 13.1).
+            session_fields = {"session_id": ctx.session_id} if ctx.session_id else {}
+            turn_log = log.bind(turn=ctx.turn_number, **session_fields)
 
             # SPEC 16.5 exit 4 / SPEC 12.4: prompt failure fails the attempt.
             try:
@@ -594,13 +614,59 @@ class AgentRunner:
 
         return execute
 
-    def _make_event_sink(self, issue_id: str, log: LoggerLike) -> Callable[[AgentEvent], None]:
+    def apply_config(
+        self, config: ServiceConfig, workflow: WorkflowDefinition | None = None
+    ) -> None:
+        """Adopt a reloaded config and prompt template (SPEC 6.2, 18.1 item 4).
+
+        SPEC 6.2 REQUIRES that a ``WORKFLOW.md`` change re-apply *both* config
+        and prompt content to future runs without a restart. The runner is
+        built once at startup and outlives every attempt, so without this the
+        prompt an agent receives is frozen at the value it had when the process
+        started -- the reload would update the orchestrator's cadence and
+        concurrency while silently continuing to render the old prompt.
+
+        Attempts already in flight keep the config they started with; SPEC 6.2
+        does not require restarting in-flight sessions.
+        """
+        self._config = config
+        if workflow is not None:
+            self._workflow = workflow
+
+    @staticmethod
+    def _session_logger(
+        log: LoggerLike, ctx: _AttemptContext, thread_id: str | None
+    ) -> LoggerLike:
+        """Bind the SPEC 13.1 session-lifecycle context known right now.
+
+        ``session_id`` is omitted rather than guessed until the app-server has
+        reported it, because a wrong value is worse than an absent one; every
+        log emitted after the first turn starts carries it.
+        """
+        fields: dict[str, Any] = {"thread_id": thread_id}
+        if ctx.session_id:
+            fields["session_id"] = ctx.session_id
+        return log.bind(**fields)
+
+    def _make_event_sink(
+        self, issue_id: str, log: LoggerLike, ctx: _AttemptContext | None = None
+    ) -> Callable[[AgentEvent], None]:
         """SPEC 16.5 ``on_message`` -> ``{codex_update, issue.id, msg}`` (SPEC 10.7.4).
+
+        Also harvests ``session_id`` from the ``session_started`` payload. That
+        is the only place the runner can learn it — SPEC 4.2 composes it from
+        ``thread_id`` and ``turn_id``, and only the app-server client sees the
+        latter — and SPEC 13.1 requires it on session-lifecycle logs.
 
         A failing observer must not take down the run (SPEC 14.2, 17.6).
         """
 
         def sink(event: AgentEvent) -> None:
+            if ctx is not None:
+                payload = getattr(event, "payload", None) or {}
+                found = payload.get("session_id")
+                if isinstance(found, str) and found:
+                    ctx.session_id = found
             try:
                 self._on_event(issue_id, event)
             except Exception as exc:  # observer isolation is the point

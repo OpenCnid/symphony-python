@@ -267,3 +267,30 @@ the ⛔ and ⚠️ rows before treating it as green.
 | Run the Real Integration Profile with valid credentials and network access | ⛔ Not done. See §9. |
 | Verify hook execution and workflow path resolution on the target host OS/shell | ⚠️ Verified on this host (Windows 10 + Git Bash) by `test_hooks.py::test_windows_uses_a_posix_shell_when_one_is_installed`, `::test_documented_windows_cmd_fallback_actually_executes`. **Not** verified on any other target host — this is a per-deployment check by design. |
 | If the HTTP server ships, verify port behavior and loopback/default bind on the target environment | ⚠️ Verified on this host by `test_http.py::test_server_binds_an_ephemeral_loopback_port_and_serves`. Per-deployment verification still required. |
+
+---
+
+## 13. Audit correction, 2026-07-28
+
+An audit arm tasked with disproving the conformance claim found that **two
+SPEC 18.1 items marked ✅ in this document were not met**. Both are now
+implemented and covered; the corrections are recorded here rather than silently
+edited above, because a traceability document that quietly revises its own
+verdicts is worth less than one that shows them changing.
+
+| Item | Was | Finding | Now |
+|---|---|---|---|
+| 4 — dynamic watch/reload/re-apply | ✅ | The reload reached the orchestrator's poll cadence, concurrency, and state lists, but **not the prompt** — nor codex settings, hooks, or workspace root. `AgentRunner`, `HookRunner`, and `WorkspaceManager` are built once at startup and were never handed a new config, so agents kept rendering the prompt frozen at process start. 3 of 6 SPEC 6.2 knobs re-applied. | ✅ All 8 knobs verified re-applying by a live before/after probe. `apply_config` added to the three long-lived collaborators and wired into `ServiceHost.reload_workflow`. |
+| 17 — logs carry `session_id` | ✅ | `session_id=` appeared **zero** times as a log field anywhere in `src/`. The cited tests constructed the field by hand inside the test, proving the logging library renders what it is passed — not that any production path passed one. | ✅ The runner harvests `session_id` from the `session_started` payload (the only place it can learn `turn_id`) and binds it on session-lifecycle and per-turn logs. Omitted rather than guessed before it is known. |
+
+The audit also confirmed that the caveat already recorded in §10 is stronger
+than it read: the app-server suite's protocol assertions were shown to pass
+identically against **deliberately nonsensical method names**, because the fake
+server's method table is generated from the same `ProtocolNames` object the
+client uses. The 40+ real login shells genuinely exercise framing, lifecycle,
+and timeouts — but they are protocol-agnostic by construction, so the passing
+suite is not evidence about wire compatibility in either direction. Item 10
+remains ⚠️.
+
+Findings against the SPEC 15 security posture are recorded separately in
+`SECURITY.md` §12.

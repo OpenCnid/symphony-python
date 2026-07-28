@@ -439,9 +439,12 @@ class GitHubProjectsAdapter(TrackerAdapter):
                 )
             match = _VAR_REF.match(raw.strip())
             if match is None:
-                # Literal credential: nothing is read from the environment, so
-                # there is no env name for the launcher to strip.
-                return raw.strip(), ()
+                # Literal credential. The adapter reads nothing from the
+                # environment, but GITHUB_TOKEN is set host-side by the `gh`
+                # CLI and by every CI runner regardless of what WORKFLOW.md
+                # says -- so it is declared defensively. SPEC 15.3 is about
+                # what the *child* can read, not about what this adapter used.
+                return raw.strip(), (token_env,)
             name = match.group(1)
             value = os.environ.get(name, "")
             if not value.strip():
@@ -467,10 +470,12 @@ class GitHubProjectsAdapter(TrackerAdapter):
     def secret_environment_names(self) -> list[str]:
         """Env names the launcher strips from child environments (SPEC 15.3).
 
-        Only names this adapter actually reads are declared. A literal
-        ``provider.token`` declares nothing because nothing is read from the
-        environment — but SPEC 15.3 warns against literal credentials in a
-        repo-owned ``WORKFLOW.md`` the child can read.
+        The configured token env name is always declared, including when the
+        credential came from a literal — ``GITHUB_TOKEN`` is set host-side by
+        the ``gh`` CLI and by CI runners whatever ``WORKFLOW.md`` says, and the
+        requirement is that the *child* cannot read a token, not that this
+        adapter avoided reading one. SPEC 15.3 additionally warns against
+        literal credentials in a repo-owned ``WORKFLOW.md`` the child can read.
         """
         return list(self._secret_env_names)
 

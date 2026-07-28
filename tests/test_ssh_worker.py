@@ -143,7 +143,7 @@ class FakeTransport:
 
     def __init__(self, responses: dict[str, CommandResult] | None = None) -> None:
         self.responses = responses or {}
-        self.default = CommandResult(0, f"{ROOT}\n{ROOT}/ABC-1\n", "")
+        self.default = CommandResult(0, f"{ROOT}\n{ROOT}/abc-1\n", "")
         self.run_calls: list[tuple[str, str]] = []
         self.spawn_calls: list[tuple[str, str, dict[str, str]]] = []
         self.spawn_error: Exception | None = None
@@ -177,7 +177,7 @@ def make_worker(
     return SSHWorker(cfg, transport=tp), tp  # type: ignore[arg-type]
 
 
-def make_assignment(host: str = "build-1", identifier: str = "ABC-1") -> HostAssignment:
+def make_assignment(host: str = "build-1", identifier: str = "abc-1") -> HostAssignment:
     return HostAssignment(
         host=SSHHost.parse(host),
         issue_identifier=identifier,
@@ -215,9 +215,9 @@ def test_ssh_enabled_predicate_tracks_config() -> None:
 async def test_disabled_pool_refuses_to_assign_rather_than_running_locally() -> None:
     pool = HostPool.from_config(FakeServiceConfig())  # type: ignore[arg-type]
     with pytest.raises(NoSSHHostsConfigured):
-        pool.try_acquire("ABC-1", remote_root=ROOT)
+        pool.try_acquire("abc-1", remote_root=ROOT)
     with pytest.raises(NoSSHHostsConfigured):
-        await pool.acquire("ABC-1", remote_root=ROOT)
+        await pool.acquire("abc-1", remote_root=ROOT)
 
 
 # ==========================================================================
@@ -248,8 +248,8 @@ def test_normalize_remote_path_rejects_unsafe_inputs(bad: str) -> None:
 def test_remote_containment_is_component_wise_not_string_prefix() -> None:
     """``/srv/ws-evil`` shares a string prefix with ``/srv/ws`` but is outside it."""
     with pytest.raises(RemoteWorkspacePathEscapesRoot):
-        assert_remote_within_root("/srv/ws-evil/ABC-1", "/srv/ws")
-    assert assert_remote_within_root("/srv/ws/ABC-1", "/srv/ws") == PurePosixPath("/srv/ws/ABC-1")
+        assert_remote_within_root("/srv/ws-evil/abc-1", "/srv/ws")
+    assert assert_remote_within_root("/srv/ws/abc-1", "/srv/ws") == PurePosixPath("/srv/ws/abc-1")
 
 
 def test_remote_containment_is_strict_so_root_is_not_inside_itself() -> None:
@@ -260,7 +260,7 @@ def test_remote_containment_is_strict_so_root_is_not_inside_itself() -> None:
 def test_remote_containment_is_case_sensitive_unlike_the_local_check() -> None:
     """The remote host is POSIX; case-folding would merge two real directories."""
     with pytest.raises(RemoteWorkspacePathEscapesRoot):
-        assert_remote_within_root("/srv/WS/ABC-1", "/srv/ws")
+        assert_remote_within_root("/srv/WS/abc-1", "/srv/ws")
 
 
 def test_remote_paths_do_not_consult_the_local_filesystem() -> None:
@@ -269,8 +269,8 @@ def test_remote_paths_do_not_consult_the_local_filesystem() -> None:
     ``symphony.workspace.safety`` resolves against the local filesystem, which
     on Windows would rewrite this into a drive-rooted backslash path.
     """
-    got = remote_workspace_path(ROOT, "ABC-1")
-    assert str(got) == f"{ROOT}/ABC-1"
+    got = remote_workspace_path(ROOT, "abc-1")
+    assert str(got) == f"{ROOT}/abc-1"
     assert "\\" not in str(got)
 
 
@@ -335,7 +335,7 @@ def test_launch_command_reparses_to_the_validated_workspace_path() -> None:
 
 
 def test_launch_command_neutralizes_injection_in_the_codex_command() -> None:
-    line = build_remote_launch_command(f"{ROOT}/ABC-1", "codex app-server; rm -rf /")
+    line = build_remote_launch_command(f"{ROOT}/abc-1", "codex app-server; rm -rf /")
     tokens = shlex.split(line)
     # The whole codex.command stays ONE token: the ';' never becomes an operator.
     assert tokens[-1] == "codex app-server; rm -rf /"
@@ -343,9 +343,9 @@ def test_launch_command_neutralizes_injection_in_the_codex_command() -> None:
 
 
 def test_launch_command_honors_spec_10_1_invocation() -> None:
-    line = build_remote_launch_command(f"{ROOT}/ABC-1", "codex app-server")
+    line = build_remote_launch_command(f"{ROOT}/abc-1", "codex app-server")
     tokens = shlex.split(line)
-    assert tokens[:3] == ["cd", "--", f"{ROOT}/ABC-1"]
+    assert tokens[:3] == ["cd", "--", f"{ROOT}/abc-1"]
     assert tokens[4:7] == ["exec", "bash", "-lc"]
 
 
@@ -365,7 +365,7 @@ def test_a_data_token_spelled_like_an_operator_is_still_quoted() -> None:
 
 
 def test_generated_launch_line_contains_exactly_one_real_operator() -> None:
-    line = build_remote_launch_command(f"{ROOT}/ABC-1", "codex app-server")
+    line = build_remote_launch_command(f"{ROOT}/abc-1", "codex app-server")
     assert line.count(" && ") == 1
     assert "'&&'" not in line
 
@@ -377,11 +377,11 @@ def test_launch_command_rejects_a_path_that_escapes_before_quoting() -> None:
 
 def test_launch_command_rejects_an_empty_codex_command() -> None:
     with pytest.raises(RemoteQuotingError):
-        build_remote_launch_command(f"{ROOT}/ABC-1", "   ")
+        build_remote_launch_command(f"{ROOT}/abc-1", "   ")
 
 
 def test_probe_command_is_pure_data_and_checks_writability() -> None:
-    line = build_remote_probe_command(f"{ROOT}/ABC-1", ROOT)
+    line = build_remote_probe_command(f"{ROOT}/abc-1", ROOT)
     tokens = shlex.split(line)
     assert tokens.count("pwd") == 2 and tokens.count("-P") == 2
     assert tokens[4:7] == ["test", "-w", "."]
@@ -393,11 +393,11 @@ def test_cleanup_command_refuses_a_path_outside_the_remote_root() -> None:
         build_remote_cleanup_command("/etc", ROOT)
     with pytest.raises(RemoteWorkspacePathEscapesRoot):
         build_remote_cleanup_command(ROOT, ROOT)  # never rm -rf the root itself
-    assert shlex.split(build_remote_cleanup_command(f"{ROOT}/ABC-1", ROOT)) == [
+    assert shlex.split(build_remote_cleanup_command(f"{ROOT}/abc-1", ROOT)) == [
         "rm",
         "-rf",
         "--",
-        f"{ROOT}/ABC-1",
+        f"{ROOT}/abc-1",
     ]
 
 
@@ -439,9 +439,9 @@ def test_ssh_argv_never_lets_a_host_entry_become_an_option() -> None:
 
 async def test_assignment_carries_host_and_workspace_as_execution_identity() -> None:
     pool = HostPool(["build-1"])
-    a = await pool.acquire("ABC-1", remote_root=ROOT, attempt=2)
+    a = await pool.acquire("abc-1", remote_root=ROOT, attempt=2)
     assert a.host.spec == "build-1"
-    assert str(a.workspace_path) == f"{ROOT}/ABC-1"
+    assert str(a.workspace_path) == f"{ROOT}/abc-1"
     assert a.attempt == 2
     assert a.to_dict()["host"] == "build-1"
 
@@ -545,7 +545,7 @@ async def test_lease_releases_the_slot_even_when_the_body_raises() -> None:
 async def test_continuation_turns_reuse_one_assignment_for_a_worker_lifetime() -> None:
     """SPEC A.1: continuation turns SHOULD stay on the same host and workspace."""
     pool = HostPool(["build-1", "build-2"], max_concurrent_agents_per_host=4)
-    async with pool.lease("ABC-1", remote_root=ROOT) as assignment:
+    async with pool.lease("abc-1", remote_root=ROOT) as assignment:
         seen = {(assignment.host.spec, str(assignment.workspace_path)) for _ in range(5)}
     assert len(seen) == 1
     assert pool.in_use(assignment.host.spec) == 0
@@ -553,14 +553,14 @@ async def test_continuation_turns_reuse_one_assignment_for_a_worker_lifetime() -
 
 def test_pool_snapshot_names_host_owner_and_workspace_for_operators() -> None:
     pool = HostPool(["build-1", "build-2"], max_concurrent_agents_per_host=1)
-    a = pool.try_acquire("ABC-1", remote_root=ROOT)
+    a = pool.try_acquire("abc-1", remote_root=ROOT)
     assert a is not None
     snap = pool.snapshot()
     assert snap["enabled"] is True
     by_host = {h["host"]: h for h in snap["hosts"]}
     assert by_host[a.host.spec]["in_use"] == 1
     assert by_host[a.host.spec]["has_capacity"] is False
-    assert a.to_dict()["workspace_path"] == f"{ROOT}/ABC-1"
+    assert a.to_dict()["workspace_path"] == f"{ROOT}/abc-1"
 
 
 def test_pool_rejects_a_host_that_is_not_a_member() -> None:
@@ -727,7 +727,7 @@ def test_failover_decision_is_json_safe() -> None:
 async def test_preflight_rechecks_containment_against_remote_resolution() -> None:
     """The remote symlink escape a local check structurally cannot see.
 
-    Lexically ``/srv/.../ABC-1`` is inside the root. The remote host resolves it
+    Lexically ``/srv/.../abc-1`` is inside the root. The remote host resolves it
     to ``/tmp/elsewhere`` because a component is a symlink. Only the ``pwd -P``
     output reveals this.
     """
@@ -740,10 +740,10 @@ async def test_preflight_rechecks_containment_against_remote_resolution() -> Non
 
 async def test_preflight_accepts_a_remotely_resolved_root_that_moved_together() -> None:
     """If root and workspace both resolve under a new prefix, containment holds."""
-    transport = FakeTransport({"pwd": CommandResult(0, "/mnt/real\n/mnt/real/ABC-1\n", "")})
+    transport = FakeTransport({"pwd": CommandResult(0, "/mnt/real\n/mnt/real/abc-1\n", "")})
     worker, _ = make_worker(transport=transport)
     result = await worker.preflight(make_assignment())
-    assert str(result.resolved_workspace) == "/mnt/real/ABC-1"
+    assert str(result.resolved_workspace) == "/mnt/real/abc-1"
     assert str(result.resolved_root) == "/mnt/real"
 
 
@@ -771,7 +771,7 @@ async def test_worker_launch_command_matches_spec_10_1_remotely() -> None:
     worker, _ = make_worker()
     line = worker.launch_command(make_assignment())
     assert shlex.split(line) == [
-        "cd", "--", f"{ROOT}/ABC-1", "&&", "exec", "bash", "-lc", "codex app-server",
+        "cd", "--", f"{ROOT}/abc-1", "&&", "exec", "bash", "-lc", "codex app-server",
     ]  # fmt: skip
 
 
@@ -781,7 +781,7 @@ async def test_remote_client_sends_posix_workspace_paths_on_the_wire() -> None:
     client = worker.app_server_client(
         make_assignment(), tool_specs=[], tool_executor=lambda *_: None, on_event=lambda _e: None
     )
-    assert str(client.workspace) == f"{ROOT}/ABC-1"
+    assert str(client.workspace) == f"{ROOT}/abc-1"
     assert "\\" not in str(client.workspace)
     assert client.launch_argv() == [worker.launch_command(make_assignment())]
     assert transport.spawn_calls == []
@@ -797,7 +797,7 @@ async def test_remote_client_spawns_over_the_transport_with_the_remote_command()
     assert isinstance(proc, FakeProcess)
     host_spec, command, env = transport.spawn_calls[0]
     assert host_spec == "build-2"
-    assert shlex.split(command)[2] == f"{ROOT}/ABC-1"
+    assert shlex.split(command)[2] == f"{ROOT}/abc-1"
     assert env == {"HOME": "/h"}
 
 
@@ -818,8 +818,8 @@ async def test_remote_client_enforces_invariant_1_in_remote_terms() -> None:
     worker, _ = make_worker()
     bad = HostAssignment(
         host=SSHHost.parse("build-1"),
-        issue_identifier="ABC-1",
-        workspace_path=PurePosixPath("/tmp/elsewhere/ABC-1"),
+        issue_identifier="abc-1",
+        workspace_path=PurePosixPath("/tmp/elsewhere/abc-1"),
         remote_root=PurePosixPath(ROOT),
     )
     client = worker.app_server_client(
@@ -855,7 +855,7 @@ async def test_start_session_drives_the_whole_remote_launch_path() -> None:
 
     host_spec, command, _env = transport.spawn_calls[0]
     assert host_spec == "build-1"
-    assert shlex.split(command)[2] == f"{ROOT}/ABC-1"
+    assert shlex.split(command)[2] == f"{ROOT}/abc-1"
     assert transport.processes[0].terminated is True  # session lifecycle stays local
 
 
@@ -865,7 +865,7 @@ async def test_start_session_refuses_an_escaping_workspace_before_spawning() -> 
     worker, _ = make_worker(transport=transport)
     bad = HostAssignment(
         host=SSHHost.parse("build-1"),
-        issue_identifier="ABC-1",
+        issue_identifier="abc-1",
         workspace_path=PurePosixPath("/tmp/elsewhere"),
         remote_root=PurePosixPath(ROOT),
     )
@@ -926,7 +926,7 @@ async def test_cleanup_reports_a_failing_remote_remove() -> None:
 
 async def test_worker_assign_and_release_round_trip() -> None:
     worker, _ = make_worker(hosts=("build-1",), per_host=1)
-    a = await worker.assign("ABC-1", attempt=1)
+    a = await worker.assign("abc-1", attempt=1)
     assert worker.try_assign("ABC-2") is None  # saturated: dispatch waits
     await worker.release(a)
     assert worker.try_assign("ABC-2") is not None
@@ -935,7 +935,7 @@ async def test_worker_assign_and_release_round_trip() -> None:
 async def test_worker_snapshot_answers_the_operator_questions() -> None:
     """SPEC A.3: which host owns a run and where its workspace lives."""
     worker, _ = make_worker(hosts=("build-1",), per_host=2)
-    a = await worker.assign("ABC-1")
+    a = await worker.assign("abc-1")
     snap = worker.snapshot()
     assert snap["ssh_enabled"] is True
     assert snap["remote_root"] == ROOT
@@ -945,7 +945,7 @@ async def test_worker_snapshot_answers_the_operator_questions() -> None:
 
 async def test_worker_progress_starts_unlatched_per_lifetime() -> None:
     worker, _ = make_worker()
-    a = await worker.assign("ABC-1")
+    a = await worker.assign("abc-1")
     p1 = worker.progress_for(a)
     p1.mark_turn_dispatched(1)
     p2 = worker.progress_for(a)  # a new worker lifetime starts clean
@@ -957,7 +957,7 @@ async def test_worker_disabled_when_ssh_hosts_omitted() -> None:
     worker = SSHWorker(FakeServiceConfig(), transport=FakeTransport())  # type: ignore[arg-type]
     assert worker.enabled is False
     with pytest.raises(NoSSHHostsConfigured):
-        await worker.assign("ABC-1")
+        await worker.assign("abc-1")
 
 
 async def test_explicit_remote_root_override_wins_over_config() -> None:
@@ -966,8 +966,8 @@ async def test_explicit_remote_root_override_wins_over_config() -> None:
         transport=FakeTransport(),
         remote_root="/data/ws",
     )
-    a = await worker.assign("ABC-1")
-    assert str(a.workspace_path) == "/data/ws/ABC-1"
+    a = await worker.assign("abc-1")
+    assert str(a.workspace_path) == "/data/ws/abc-1"
 
 
 # ==========================================================================

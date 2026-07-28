@@ -429,3 +429,88 @@ Before pointing this at a real repository:
 This is an engineering preview built from the [openai/symphony](https://github.com/openai/symphony)
 specification. Report issues through this repository's issue tracker, and do not
 include credentials, tokens, or live tracker payloads in a report.
+
+---
+
+## 12. Adversarial audit, 2026-07-28
+
+An audit arm was tasked with *disproving* the four claims above rather than
+confirming them, and verified by causing behavior rather than reading code.
+Claim 3 (secrets never reach logs, errors, or prompt context) survived every
+attack. The other three did not. All findings below are fixed and covered by
+regression tests; they are recorded rather than quietly patched because the
+reasoning matters more than the diff.
+
+### 12.1 Workspace keys collided on case-insensitive filesystems — fixed
+
+`ENG-42` and `eng-42` produced two distinct keys that resolved to **one
+directory** on Windows and macOS, placing two coding agents in the same
+workspace. The second issue also saw `created_now=False`, so its `after_create`
+hook never ran. Sanitization was not the last normalizer between an identifier
+and a directory — the filesystem folds case, and Windows additionally strips
+trailing dots and spaces.
+
+SPEC 4.2 mandates the hash suffix only on *sanitization* change, which is a
+POSIX-first reading; SPEC 9.5 Invariant 3's actual requirement is collision
+resistance. `models.workspace_key` now also appends the hash when the key could
+fold — while leaving `.` and `..` untouched so they still reach the containment
+check that rejects them. Already-safe lowercase keys stay plain and readable.
+
+### 12.2 `bash -lc` restored the stripped credential — fixed
+
+The strip chain (adapter declares → runner passes → client removes from the
+environment copy) was correct and provably insufficient. SPEC 10.1 mandates
+`-l`, which sources the login profile **after** the strip — and exporting a
+tracker token from `~/.bash_profile` is a normal way for one to be set at all.
+A real child process was observed receiving the credential the strip had
+removed.
+
+`codex.command` is now prefixed with `unset -v` for each declared secret name,
+which runs after profile sourcing and before the agent. The environment strip
+is retained as defense in depth. Verified by reproduction: without the prefix
+the child prints the token, with it the child prints nothing.
+
+### 12.3 A literal GitHub token declared nothing — fixed
+
+`GITHUB_TOKEN` is set host-side by the `gh` CLI and by every CI runner
+regardless of what `WORKFLOW.md` says, so declaring nothing on the grounds that
+this adapter used a literal left that host token readable by the agent. The
+GitHub adapter now always declares its configured token env name, matching what
+the Linear adapter already did.
+
+### 12.4 Two paths could stall a run indefinitely — fixed
+
+SPEC 10.5 states a run MUST NOT stall waiting for user input. Two reachable
+paths did:
+
+1. **An unrecognized user-input method name.** Dispatch was exact string
+   equality against `ProtocolNames.user_input`, whose spelling is unverified
+   against a real Codex. A variant spelling was answered and discarded in a
+   loop observed running past **16×** its configured turn timeout. Nothing
+   bounded it: the turn-silence timeout and the orchestrator stall timeout are
+   both activity-based, and re-requesting is activity. `app_server` now also
+   consults `approvals.classify_approval`, which is lenient about spelling by
+   design and was simply never asked.
+2. **A `FAIL_RUN` verdict could not end a run.** The bridge between
+   `agent.approvals` (four outcomes) and the app-server wire (two) collapsed
+   them to a boolean, discarding exactly the one SPEC 10.5 depends on. A denied
+   request left the agent free to ask again forever. `ApprovalDecision` now
+   carries `ends_run`, and the client finishes the turn when it is set.
+
+### 12.5 Open, unresolved
+
+- **`workspace.safety.assert_launch_cwd` is not called from production code.**
+  The client's own check validates absolute + `is_dir()` but does not verify
+  the workspace against the configured root. No reachable state was found where
+  an out-of-root workspace arrives at the client under the default wiring
+  (`create_for_issue` gates it), so this is an untested and previously
+  mis-documented control rather than a demonstrated hole.
+- **A `mkdir` on a Windows device name** (`NUL`) succeeds while creating
+  nothing, so `create_for_issue("NUL")` reports a workspace that does not
+  exist. Fail-safe — the launch is rejected downstream — but the reported
+  success is wrong.
+- **Hook output is truncated but not scrubbed.** A hook that echoes a token
+  puts it in a log. Hooks are fully trusted configuration per SPEC 15.4, but
+  operators should know.
+- The `bash -lc` restore applies equally to a **remote** host's login profile
+  under the SSH extension; the same `unset` prefix is not yet applied there.
