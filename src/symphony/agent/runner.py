@@ -273,10 +273,19 @@ def _default_app_server_factory(
     on_event: Callable[[AgentEvent], None],
     secret_env_names: Sequence[str] = (),
     approval_decider: Callable[[str, Mapping[str, Any]], Any] | None = None,
+    agent_kind: str = "codex",
+    issue_identifier: str | None = None,
 ) -> AppServerClientLike:
-    from symphony.agent.app_server import AppServerClient
+    """Build the coding-agent client for the selected backend.
 
-    return AppServerClient(
+    ``agent_kind`` chooses between the Codex app-server and Claude Code. The
+    two are interchangeable behind ``symphony.agent.base.CodingAgentClient``, so
+    nothing downstream of this call branches on which one is running.
+    """
+    from symphony.agent.base import build_agent_client
+
+    return build_agent_client(  # type: ignore[return-value]
+        agent_kind,
         cfg,
         workspace=workspace,
         tool_specs=tool_specs,
@@ -284,6 +293,7 @@ def _default_app_server_factory(
         on_event=on_event,
         secret_env_names=secret_env_names,
         approval_decider=approval_decider or _canonical_approval_decider,
+        issue_identifier=issue_identifier,
     )
 
 
@@ -462,14 +472,18 @@ class AgentRunner:
             # token. This is the only place the two halves meet -- the adapter
             # cannot strip what it does not launch, and the client cannot know
             # which names matter without being told.
+            agent_kind = str(getattr(self._config, "agent_kind", "codex") or "codex")
+            backend_cfg = getattr(self._config, "agent_config", None) or self._config.codex
             client = self._app_server_factory(
-                self._config.codex,
+                backend_cfg,
                 workspace=workspace_path,
                 tool_specs=list(self._tracker.agent_tool_specs()),
                 tool_executor=self._make_tool_executor(ctx),
                 on_event=self._make_event_sink(issue.id, log, ctx),
                 secret_env_names=tuple(self._tracker.secret_environment_names()),
                 approval_decider=_canonical_approval_decider,
+                agent_kind=agent_kind,
+                issue_identifier=issue.identifier,
             )
             session = await client.start_session()
         except BaseException as exc:

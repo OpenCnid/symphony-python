@@ -68,6 +68,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from symphony.agent.base import AgentBackendSpec, register_backend
 from symphony.agent.events import AgentEvent
 from symphony.errors import (
     AgentError,
@@ -1120,3 +1121,24 @@ def _error_payload(exc: BaseException) -> dict[str, Any]:
 def _safe_details(payload: Mapping[str, Any]) -> dict[str, Any]:
     """JSON-safe error details; never carries secrets (SPEC 15.3)."""
     return {k: v for k, v in payload.items() if k in {"turn_id", "reason", "returncode"}}
+
+
+# --------------------------------------------------------------------------
+# Backend registration (see symphony/agent/base.py)
+# --------------------------------------------------------------------------
+
+
+def _build_codex_client(cfg: Any, **kwargs: Any) -> AppServerClient:
+    """Adapt the shared backend factory call to this client's constructor."""
+    kwargs.pop("issue_identifier", None)  # Claude-specific; harmless to ignore
+    return AppServerClient(cfg, **kwargs)
+
+
+register_backend(
+    AgentBackendSpec(
+        kind="codex",
+        config_key="codex",
+        factory=_build_codex_client,
+        description="Codex app-server over JSON-RPC stdio (protocol strings unverified)",
+    )
+)

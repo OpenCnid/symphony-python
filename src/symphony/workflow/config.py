@@ -29,6 +29,7 @@ import copy
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -112,6 +113,11 @@ DEFAULT_READ_TIMEOUT_MS = 5_000
 #: (SPEC 5.3.6), which is why this is the one duration field where a
 #: non-positive value is *valid* rather than a fallback to the default.
 DEFAULT_STALL_TIMEOUT_MS = 300_000
+
+#: Default coding-agent backend when ``agent.kind`` is absent. Codex is the
+#: default because it is the specification's worked example; selecting Claude
+#: Code is an explicit choice.
+DEFAULT_AGENT_KIND = "codex"
 
 _MAX_TCP_PORT = 65_535
 
@@ -265,7 +271,30 @@ class ServiceConfig:
     server_port: int | None
     ssh_hosts: tuple[str, ...]
     max_concurrent_agents_per_host: int | None
+    #: Which coding-agent backend runs the work (``codex`` or ``claude``).
+    #: SPEC 10 describes the agent boundary using Codex as its worked example
+    #: but fixes nothing Codex-specific on Symphony's side, so the backend is
+    #: selectable. See ``symphony.agent.base``.
+    agent_kind: str = DEFAULT_AGENT_KIND
+    #: Typed settings for the *selected* backend, read from the front-matter
+    #: block that backend owns (``codex:`` or ``claude:``). Kept separate so one
+    #: workflow can carry both and switch with a single line.
+    agent_config: Any = None
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def agent_timeouts(self) -> tuple[int, int, int]:
+        """``(turn, read, stall)`` timeouts for the selected backend (SPEC 10.6).
+
+        The orchestrator enforces stall detection and must read it from
+        whichever backend is active, not from ``codex`` unconditionally.
+        """
+        cfg = self.agent_config if self.agent_config is not None else self.codex
+        return (
+            int(getattr(cfg, "turn_timeout_ms", self.codex.turn_timeout_ms)),
+            int(getattr(cfg, "read_timeout_ms", self.codex.read_timeout_ms)),
+            int(getattr(cfg, "stall_timeout_ms", self.codex.stall_timeout_ms)),
+        )
 
     def is_active(self, state: str) -> bool:
         """SPEC 5.3.1/8.2: state membership, compared case-insensitively."""
@@ -547,6 +576,11 @@ def build_config(defn: WorkflowDefinition) -> ServiceConfig:
         stall_timeout_ms=stall_timeout_ms,
     )
 
+    # SPEC 5.3 permits extension keys. `agent.kind` selects the coding-agent
+    # backend; an unrecognized value is left as-is here so SPEC 6.3 preflight
+    # reports it with the supported list rather than silently falling back.
+    agent_kind = _passthrough(agent.get("kind"), DEFAULT_AGENT_KIND)
+
     per_host = _coerce_int(worker.get("max_concurrent_agents_per_host"))
     if per_host is not None and per_host <= 0:
         per_host = None
@@ -578,6 +612,8 @@ def build_config(defn: WorkflowDefinition) -> ServiceConfig:
         server_port=_server_port(server.get("port")),
         ssh_hosts=_string_list(worker.get("ssh_hosts")),
         max_concurrent_agents_per_host=per_host,
+        agent_kind=agent_kind,
+        agent_config=_agent_backend_config(agent_kind, raw, codex_config),
         raw=raw,
     )
 
@@ -625,12 +661,32 @@ def validate_dispatch_config(cfg: ServiceConfig) -> None:
             supported=supported,
         )
 
-    # Checked before adapter construction: it is pure, and there is no reason to
-    # run adapter setup for a configuration that cannot launch an agent anyway.
-    if not cfg.codex.command.strip():
+    # SPEC 6.3 check 4 generalized: whichever backend is selected must be
+    # supported and must have a launchable command. Checked before adapter
+    # construction because both are pure, and there is no reason to run adapter
+    # setup for a configuration that cannot launch an agent anyway.
+    from symphony.agent.base import backend_kinds
+
+    if cfg.agent_kind not in backend_kinds():
         raise ConfigValidationError(
-            "codex.command must be a non-empty shell command", field="codex.command"
+            f"unsupported agent.kind {cfg.agent_kind!r}",
+            field="agent.kind",
+            kind=cfg.agent_kind,
+            supported=backend_kinds(),
         )
+
+    if cfg.agent_kind == "codex":
+        if not cfg.codex.command.strip():
+            raise ConfigValidationError(
+                "codex.command must be a non-empty shell command", field="codex.command"
+            )
+    else:
+        command = str(getattr(cfg.agent_config, "command", "") or "").strip()
+        if not command:
+            raise ConfigValidationError(
+                f"{cfg.agent_kind}.command must be a non-empty command",
+                field=f"{cfg.agent_kind}.command",
+            )
 
     try:
         build_adapter(cfg.tracker_kind, copy.deepcopy(cfg.tracker_provider))
@@ -653,3 +709,33 @@ def validate_dispatch_config(cfg: ServiceConfig) -> None:
             kind=cfg.tracker_kind,
             cause_type=type(exc).__name__,
         ) from exc
+
+
+def _agent_backend_config(kind: str, raw: Mapping[str, Any], codex_config: CodexConfig) -> Any:
+    """Typed settings for the selected coding-agent backend.
+
+    Each backend owns its own front-matter block and its own schema, so a
+    third-party backend can ship settings without editing this module. Codex is
+    special-cased only because its typed view predates the abstraction and is
+    still exposed as ``ServiceConfig.codex`` for compatibility.
+
+    An unknown kind yields ``None``; SPEC 6.3 preflight is what reports it.
+    """
+    if kind == "codex":
+        return codex_config
+    try:
+        from symphony.agent.base import backend_spec
+    except Exception:  # pragma: no cover - agent package always ships
+        return None
+    try:
+        spec = backend_spec(kind)
+    except ConfigValidationError:
+        return None
+
+    block = raw.get(spec.config_key)
+    block = block if isinstance(block, Mapping) else {}
+    if kind == "claude":
+        from symphony.agent.claude import ClaudeConfig
+
+        return ClaudeConfig.from_mapping(block)
+    return dict(block)
