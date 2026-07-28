@@ -956,7 +956,11 @@ class Orchestrator:
 
     async def _reconcile_stalled_runs(self) -> None:
         """SPEC 8.5 Part A — stall detection kills the worker and queues a retry."""
-        timeout_ms = int(getattr(self.config.codex, "stall_timeout_ms", 0) or 0)
+        timeouts = getattr(self.config, "agent_timeouts", None)
+        if isinstance(timeouts, tuple) and len(timeouts) == 3:
+            timeout_ms = int(timeouts[2])
+        else:
+            timeout_ms = int(getattr(self.config.codex, "stall_timeout_ms", 0) or 0)
         if timeout_ms <= 0:
             return
 

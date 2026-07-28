@@ -9,6 +9,12 @@ polls an issue tracker, creates a per-issue workspace, runs a coding-agent
 session inside that workspace, and reconciles the run against tracker state —
 so teams manage *work* instead of supervising agents.
 
+The coding agent is pluggable. Two backends ship: **Codex** (`agent.kind: codex`,
+the default and the specification's worked example) and **Claude Code**
+(`agent.kind: claude`). They differ in capability and in how much of each has
+been verified against a real binary — see
+[`docs/agent-backends.md`](docs/agent-backends.md) before choosing.
+
 > [!WARNING]
 > Like upstream, this is an engineering preview intended for trusted
 > environments. Read [`docs/SECURITY.md`](docs/SECURITY.md) before pointing it
@@ -87,6 +93,7 @@ tracker:
   active_states: ["Todo", "In Progress"]
   terminal_states: ["Done", "Canceled"]
 agent:
+  kind: codex          # or: claude
   max_concurrent_agents: 4
   max_turns: 20
 codex:
@@ -95,6 +102,11 @@ codex:
 
 You are working on {{ issue.identifier }}: {{ issue.title }}.
 ```
+
+`agent.kind` selects the coding-agent backend, and each backend reads its own
+front-matter block — `codex:` or `claude:`. Only the selected block is parsed, so
+one file can carry both and switch with a single line. Full field reference in
+[`docs/agent-backends.md`](docs/agent-backends.md).
 
 ## Documentation
 
@@ -105,6 +117,7 @@ You are working on {{ issue.identifier }}: {{ issue.title }}.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layer-by-layer design |
 | [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) | Spec requirement → module → test traceability |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | Trust boundary and documented policy positions |
+| [`docs/agent-backends.md`](docs/agent-backends.md) | Choosing and configuring the Codex and Claude Code backends |
 | [`docs/RLM.md`](docs/RLM.md) | The Recursive Language Model surface |
 | [`docs/adapters/`](docs/adapters/) | Per-adapter profiles required by SPEC 11.2 |
 

@@ -77,7 +77,7 @@ REASON_NOT_ACTIVE = "issue state is neither active nor terminal"
 REASON_MISSING = "issue is no longer visible in the configured tracker scope"
 
 #: SPEC 8.5 Part A — no coding-agent activity inside ``codex.stall_timeout_ms``.
-REASON_STALLED = "no coding-agent activity within codex.stall_timeout_ms"
+REASON_STALLED = "no coding-agent activity within the configured stall timeout"
 
 
 # --------------------------------------------------------------------------
@@ -241,6 +241,20 @@ class StallDecision:
     attempt: int
     reason: str = REASON_STALLED
     phase: RunPhase = RunPhase.STALLED
+
+
+def stall_timeout_for(cfg: Any) -> int:
+    """SPEC 8.5 Part A timeout for the *selected* coding-agent backend.
+
+    ``ServiceConfig.agent_timeouts`` resolves ``(turn, read, stall)`` against
+    whichever backend ``agent.kind`` selected. Reading ``cfg.codex`` directly
+    would make ``claude.stall_timeout_ms`` inert and silently govern a Claude
+    run by the Codex block.
+    """
+    timeouts = getattr(cfg, "agent_timeouts", None)
+    if isinstance(timeouts, tuple) and len(timeouts) == 3:
+        return int(timeouts[2])
+    return int(getattr(getattr(cfg, "codex", None), "stall_timeout_ms", 0) or 0)
 
 
 def plan_stall_terminations(
@@ -413,7 +427,7 @@ async def reconcile_stalled_runs(
     """
     log = deps.log
     decisions = plan_stall_terminations(
-        state, stall_timeout_ms=cfg.codex.stall_timeout_ms, now=deps.now()
+        state, stall_timeout_ms=stall_timeout_for(cfg), now=deps.now()
     )
     for decision in decisions:
         if decision.issue_id not in state.running:
@@ -423,7 +437,7 @@ async def reconcile_stalled_runs(
             issue_id=decision.issue_id,
             issue_identifier=decision.identifier,
             elapsed_ms=round(decision.elapsed_ms),
-            stall_timeout_ms=cfg.codex.stall_timeout_ms,
+            stall_timeout_ms=stall_timeout_for(cfg),
             phase=decision.phase.value,
         )
         state = await _next_state(
