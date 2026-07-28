@@ -324,6 +324,8 @@ class ClaudeCodeClient:
         self._session: ClaudeSession | None = None
         self._proc: Any = None
         self._stderr_tail: list[str] = []
+        self._bridge: Any = None
+        self._mcp_config_path: Path | None = None
 
     # -- introspection (kept flat for the RLM surface) ---------------------
 
@@ -349,12 +351,55 @@ class ClaudeCodeClient:
         the first process starts when the first turn does.
         """
         self._assert_workspace()
+        await self._start_tool_bridge()
         if self.cfg.deterministic_session_id and self._issue_identifier:
             thread_id = deterministic_session_uuid(self._issue_identifier)
         else:
             thread_id = str(uuid.uuid4())
         self._session = ClaudeSession(thread_id=thread_id)
         return self._session
+
+    async def _start_tool_bridge(self) -> None:
+        """Expose the adapter's provider-native tools over MCP (SPEC 10.5, 11.5).
+
+        Only when the adapter actually ships tools *and* an executor was
+        supplied. The bridge runs in this process so the tracker credential
+        never enters the agent's process tree; see
+        :mod:`symphony.agent.mcp_bridge` for why stdio would not do.
+
+        A bridge that fails to start is logged as a degraded capability rather
+        than a failed attempt: the agent can still do the work, it just cannot
+        update the ticket itself, and failing the run would be worse than
+        running without the extension (SPEC 10.5 makes it OPTIONAL).
+        """
+        if self._bridge is not None or not self.tool_specs or self._tool_executor is None:
+            return
+        from symphony.agent.mcp_bridge import TrackerToolBridge
+
+        bridge = TrackerToolBridge(self.tool_specs, self._tool_executor)
+        try:
+            await bridge.start()
+        except Exception as exc:
+            self._emit(
+                "notification",
+                {"summary": "tracker tool bridge unavailable", "error": f"{type(exc).__name__}"},
+            )
+            return
+
+        config_path = self.workspace / ".symphony-mcp.json"
+        config_path.write_text(json.dumps(bridge.mcp_config()), encoding="utf-8")
+        self._bridge = bridge
+        self._mcp_config_path = config_path
+
+    async def _stop_tool_bridge(self) -> None:
+        bridge, path = self._bridge, self._mcp_config_path
+        self._bridge = self._mcp_config_path = None
+        if bridge is not None:
+            await bridge.stop()
+        if path is not None:
+            # The file carries the bearer token, so it does not outlive the run.
+            with suppress(OSError):
+                path.unlink()
 
     async def run_turn(
         self, session: ClaudeSession, prompt: str, *, title: str | None = None
@@ -432,7 +477,8 @@ class ClaudeCodeClient:
             self._proc = None
 
     async def stop(self) -> None:
-        """Terminate any live process. Idempotent (SPEC 16.5)."""
+        """Terminate any live process and the tool bridge. Idempotent (SPEC 16.5)."""
+        await self._stop_tool_bridge()
         proc = self._proc
         self._proc = None
         if proc is None or proc.returncode is not None:
@@ -469,8 +515,19 @@ class ClaudeCodeClient:
         argv += ["--permission-mode", cfg.permission_mode]
         if cfg.model:
             argv += ["--model", cfg.model]
+
+        # Provider-native tracker tools (SPEC 10.5, 11.5), when the bridge is up.
+        # They are appended to the configured allow-list rather than replacing
+        # it, and only when the workflow set one at all -- an empty
+        # `allowed_tools` means "no restriction", and emitting the flag would
+        # silently narrow the agent to *only* the tracker tools.
+        bridge_tools: list[str] = []
+        if self._bridge is not None and self._mcp_config_path is not None:
+            argv += ["--mcp-config", str(self._mcp_config_path)]
+            bridge_tools = list(self._bridge.allowed_tool_patterns())
+
         if cfg.allowed_tools:
-            argv += ["--allowedTools", ",".join(cfg.allowed_tools)]
+            argv += ["--allowedTools", ",".join([*cfg.allowed_tools, *bridge_tools])]
         if cfg.disallowed_tools:
             argv += ["--disallowedTools", ",".join(cfg.disallowed_tools)]
         if cfg.max_turns is not None:

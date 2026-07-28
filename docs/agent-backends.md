@@ -279,21 +279,22 @@ the definitions referenced by `v2/ThreadStartParams.json` and `v2/TurnStartParam
 | **Deterministic session ids** | Derived from the issue identifier, so the id survives an orchestrator restart. |
 | **No `bash` dependency** | Executed directly. The Codex path is required by SPEC 10.1 to use `bash -lc`, which on Windows means Git Bash on `PATH`. |
 | **A verified wire contract** | [`docs/claude-protocol.md`](claude-protocol.md). |
+| **Tracker tools over MCP** | The adapter's `agent_tool_specs()` are served by an in-process MCP endpoint and namespaced `mcp__symphony__<tool>`. Transport is **HTTP on loopback, not stdio**: a stdio server would be launched *by Claude Code* and would have to carry the tracker credential itself, putting the token inside the agent's process tree. Hosting it here means the credential never moves and only results cross. Guarded by a per-session bearer token, since loopback is not an authorization boundary and these tools write. |
 
 ### Only the Codex backend
 
 | Capability | Why Claude lacks it |
 |---|---|
-| **Tracker tools advertised to the agent** | The Codex client sends `agent_tool_specs()` in the thread-creation params and executes calls host-side, so the agent can invoke `linear_set_issue_state`, `github_add_issue_comment`, and friends without ever seeing a token. The Claude driver accepts `tool_specs`/`tool_executor` and never uses them ([gap 1](#known-gaps)). Note that the field name carrying them is one of the unverified protocol strings. |
 | **Symphony's approval state machine** | `agent/approvals.py` models four outcomes including `FAIL_RUN`, and `ApprovalDecision.ends_run` lets a denial actually end a run (SPEC 10.5). The Claude factory discards `approval_decider`; posture is entirely `--permission-mode`. |
 | **Sandbox configuration** | `thread_sandbox` / `turn_sandbox_policy` pass through to Codex. `permission_mode` is a permission gate, not a sandbox — it constrains what the agent asks to do, not what the OS lets the process do. |
 | **Remote execution** | `worker.ssh_hosts` builds an `AppServerClient` over SSH ([gap 5](#known-gaps)). |
 | **Session titles** | SPEC 10.2 asks for `<issue.identifier>: <issue.title>` where the protocol supports it. The CLI does (`-n/--name`); the driver does not pass it ([gap 6](#known-gaps)). |
-| **Test coverage** | `tests/test_app_server.py` exists. Nothing under `tests/` mentions Claude ([gap 4](#known-gaps)). |
 
 ### Equivalent in both
 
-Absolute token totals in the SPEC 13.5 shape with delta tracking upstream; the SPEC 10.4
+Provider-native tracker tools — the two reach them differently (Codex advertises them
+on the thread; Claude serves them over MCP) but an agent on either backend can move a
+ticket without holding a credential (SPEC 11.5). Absolute token totals in the SPEC 13.5 shape with delta tracking upstream; the SPEC 10.4
 event vocabulary (both emit only canonical names, so `AgentEvent.is_known` holds);
 workspace-cwd enforcement; SPEC 15.3 credential stripping; 10 MB max line size;
 protocol-stream and stderr kept strictly separate; `turn_timeout_ms` / `read_timeout_ms`.
@@ -404,38 +405,24 @@ in `AGENT_EVENT_NAMES`; rate limits reach `AgentEvent.rate_limits()`; token tota
 
 Confirmed against the code as it stands. Each is a real limitation, not a caveat.
 
-1. **Provider-native tracker tools are not advertised to Claude Code.** This is the one
-   place the Codex backend can do something the Claude backend cannot.
-   `ClaudeCodeClient.__init__` stores `tool_specs` and `tool_executor` and never reads
-   them, so an agent under `agent.kind: claude` cannot call `linear_set_issue_state`,
-   `linear_add_comment`, `github_set_project_status`, or any other host-side tracker
-   tool. SPEC 10.2 asks that implemented client-side tools be advertised.
+1. **Driver and bridge test coverage.** `tests/test_agent_claude.py` (80 tests, mutation
+   -checked 17/17) and `tests/test_mcp_bridge.py` (18 tests) now cover this backend.
+   What remains untested is the *Codex* side of the comparison: no `codex` binary is
+   available here, so `tests/test_app_server.py` exercises a scripted stdio peer whose
+   method table is generated from the same `ProtocolNames` object the client uses. That
+   suite can be fully green while a real Codex session fails at startup.
 
-   It matters beyond convenience. SPEC 11.5 routes ticket mutations through host-side
-   adapter tools precisely so the coding agent never holds a tracker credential. A run
-   still works — the agent edits the workspace and the orchestrator reconciles tracker
-   state from the outside — but an agent that must update a ticket itself needs either
-   an MCP server via `claude.mcp_config` or its own credential, and the second gives up
-   the SPEC 15.3 isolation the Codex path preserves.
-
-   Closing this properly means exposing the adapter's tools as an MCP server the CLI can
-   load. That is real work, not a small patch, and it is not done.
-
-2. **Driver test coverage is thin.** Nothing under `tests/` exercises `agent/claude.py`. The Codex
-   backend has `tests/test_app_server.py`. Read this as: the Claude *protocol* is the
-   better-verified of the two, and the Claude *driver* is the less-verified.
-
-3. **The SSH worker is Codex-only.** `ssh/worker.py` constructs an `AppServerClient`
+2. **The SSH worker is Codex-only.** `ssh/worker.py` constructs an `AppServerClient`
    directly and builds `cd -- <workspace> && exec bash -lc <codex.command>`. It does not
    branch on `agent.kind`, so `worker.ssh_hosts` with `agent.kind: claude` runs Codex
    remotely regardless of the setting.
 
-4. **No session title is passed.** `run_turn(..., title=...)` is forwarded into the
+3. **No session title is passed.** `run_turn(..., title=...)` is forwarded into the
    `session_started` event payload but never onto the command line, though the CLI accepts
    `-n/--name`. SPEC 10.2 asks for issue-identifying metadata where the protocol supports
    titles.
 
-5. **Symphony's approval machinery is bypassed.** The Claude factory discards
+4. **Symphony's approval machinery is bypassed.** The Claude factory discards
    `approval_decider`, so `agent/approvals.py` — including the `FAIL_RUN` verdict that
    SPEC 10.5 depends on to stop a run that keeps asking — never participates. Permission
    posture is whatever `--permission-mode` enforces, and by default that is

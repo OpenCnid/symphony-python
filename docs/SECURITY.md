@@ -514,3 +514,44 @@ paths did:
   operators should know.
 - The `bash -lc` restore applies equally to a **remote** host's login profile
   under the SSH extension; the same `unset` prefix is not yet applied there.
+
+---
+
+## 13. The Claude Code tracker-tool bridge
+
+`agent.kind: claude` serves the adapter's provider-native tools
+(`symphony/agent/mcp_bridge.py`) so an agent can move a ticket without holding a
+tracker credential — the SPEC 11.5 boundary the Codex backend gets by
+advertising tool specs on its app-server session.
+
+**The transport is a security decision.** MCP offers stdio and HTTP. A stdio
+server configured through `--mcp-config` is launched *by Claude Code* as its own
+child, so it would have to carry the tracker credential itself — placing the
+token inside the agent's process tree, which is precisely what §4's
+`secret_env_names` scrubbing exists to prevent. The bridge is therefore an HTTP
+server hosted **in the Symphony process**: the credential never moves, the agent
+receives a loopback URL, and tool *results* cross the boundary instead of
+secrets.
+
+Controls:
+
+- **Loopback only** (`127.0.0.1`), ephemeral port, lifetime of one attempt.
+- **Per-session bearer token** (`secrets.token_urlsafe(32)`), compared with
+  `compare_digest`. Loopback alone is not an authorization boundary — any local
+  process could otherwise mutate tracker state — and these tools are explicitly
+  allowed to write (`ToolSpec.mutates_tracker`).
+- **The config file carries the token** and is written into the workspace as
+  `.symphony-mcp.json`, then **unlinked when the client stops**. It is readable
+  by the agent for the duration of the run, which is unavoidable: the agent must
+  read it to connect. The token grants exactly the adapter's tool set, scoped to
+  the bound issue.
+- **The issue is execution context, never tool input.** The bound issue travels
+  from the runner as `ToolContext`, so the model cannot retarget a mutation at a
+  different ticket by writing another id into the arguments.
+- **Tools are named individually** in `--allowedTools`, not by wildcard, so a
+  workflow's tool policy does not widen silently when an adapter gains a tool.
+
+Residual risk worth stating: a local process that reads `.symphony-mcp.json`
+during a run can call the adapter's tools for that issue. On a single-tenant
+host that is the same trust boundary as the workspace itself; on a shared host,
+restrict the workspace root per §3 and treat the bridge as in scope.
