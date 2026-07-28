@@ -330,3 +330,110 @@ This implementation targets **trusted environments** and documents:
 - **Non-directory at a workspace path (17.2):** fail the attempt; never unlink.
 - **Reused-workspace population failure (9.3):** surface the error; never
   destructively reset.
+
+---
+
+## 6. As-built deltas
+
+Section 3 was written before the modules existed, so it names signatures the
+authors were told to build against. Where the landed code extends that contract,
+the addition is recorded here. **No signature in section 3 was changed** — every
+delta below is additive, so code written against section 3 still composes.
+
+### `workflow.watcher`
+
+Section 3 lists only `__init__`, `start`, `stop`. SPEC 6.2 also requires
+defensive re-validation in case filesystem events are missed, and SPEC 6.3
+requires per-tick validation, so the consumer needs a pull path:
+
+```python
+async WorkflowWatcher.prime() -> ReloadOutcome     # initial last-known-good, no notify
+async WorkflowWatcher.reload(*, force=False) -> ReloadOutcome
+async WorkflowWatcher.is_stale() -> bool           # digest compare, no event stream
+WorkflowWatcher.current() -> EffectiveWorkflow | None
+WorkflowWatcher.generation / .healthy / .last_error
+```
+
+An invalid reload never displaces `current()`.
+
+### `agent.app_server`
+
+```python
+AppServerClient(cfg, *, workspace, tool_specs, tool_executor, on_event,
+                approval_decider=None, secret_env_names=(), protocol=PROTOCOL,
+                spawn=None, now=None)
+```
+
+`secret_env_names` and `approval_decider` are the two the runner must supply —
+see section 5 below. `protocol` isolates every version-specific Codex string in
+one `ProtocolNames` dataclass; correcting it against a real
+`codex app-server generate-json-schema` is a one-block edit.
+
+### `agent.runner`
+
+The factory it calls gained the two parameters above:
+
+```python
+AppServerFactory(cfg, *, workspace, tool_specs, tool_executor, on_event,
+                 secret_env_names=(), approval_decider=None)
+```
+
+`TrackerLike` correspondingly requires `secret_environment_names()`.
+
+### `orchestrator.core`
+
+```python
+Orchestrator(*, config, tracker, runner, workspaces, deps=None,
+             reconciler=_UNSET, validate=None, clock=None, logger=None)
+async Orchestrator.tick(*, reschedule=False) / .start() / .stop() / .run_forever()
+async Orchestrator.invoke(fn) / .drain() / .apply_config(config)
+```
+
+`reconciler` omitted delegates to `module_reconciler`, which calls
+`orchestrator.reconcile`. An explicit `None` selects the built-in fallback.
+All state mutation is serialized through one mailbox task.
+
+### `orchestrator.reconcile`
+
+```python
+async reconcile_running_issues(state, *, cfg, tracker, deps) -> OrchestratorState
+async startup_terminal_workspace_cleanup(*, cfg, tracker, workspaces, logger=None)
+plan_reconciliation(running_ids, refreshed, cfg, *, routable=None)  # pure
+ReconcileDeps(terminate_running_issue, schedule_retry, now=..., routable=None, logger=None)
+```
+
+The module *decides*; the orchestrator *mutates* through the injected callbacks.
+That split is what lets SPEC 8.5 live here without breaking SPEC 7's
+sole-mutator invariant.
+
+### `http`
+
+Enablement is `build_http_server(source, *, cli_port=None, config_port=None, ...)`,
+returning `None` when neither port is set — the normal not-enabled result, not an
+error. `resolve_port` tests `is not None` rather than truthiness, so `--port 0`
+overrides `server.port: 9000` and still requests an ephemeral port.
+
+### `rlm`
+
+Not in section 3 at all; this implementation's own extension. Entry points are
+`open_repl()`, `system_map()`, `describe_component()`, `find_symbol()`, and
+`recursive_query()`. Every introspection result carries `_meta.chars` equal to
+`len(json.dumps(result))`, so a caller can price a descent before taking it.
+Note that symbol records key on `symbol`, not `name`.
+
+### Cross-module composition owned by no single module
+
+Three requirements sit between modules and were wired during integration rather
+than by any one author:
+
+1. **Adapter registration** — `trackers/__init__` imports `github`, `linear`, and
+   `memory` for their `@register_adapter` side effect. Without it
+   `build_adapter` raises `UnsupportedTrackerKind` for every bundled adapter.
+2. **Credential isolation (SPEC 15.3)** — `runner` reads
+   `tracker.secret_environment_names()` and passes it to the launcher as
+   `secret_env_names`. The adapter cannot strip what it does not launch; the
+   client cannot know which names matter without being told.
+3. **Approval policy (SPEC 10.5)** — `runner` passes
+   `_canonical_approval_decider`, which bridges `agent.approvals` to the
+   app-server's flat `(approved, reason)` verdict. Without it the client uses a
+   local copy of the posture and a policy swap silently has no effect.
