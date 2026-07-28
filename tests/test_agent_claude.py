@@ -19,7 +19,9 @@ import asyncio
 import importlib
 import json
 import os
+import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -58,11 +60,12 @@ from symphony.errors import (
 )
 from symphony.models import session_id as compose_session_id
 
-# Registering the sibling backend is a side effect of importing it. This test
-# module imports ``symphony.agent.claude`` directly, which populates the
-# registry and makes ``base._ensure_loaded()`` short-circuit; see
-# ``test_registry_resolves_both_shipped_backends`` for why the import below is
-# load-bearing rather than decorative.
+# Kept as a belt-and-braces import. It used to be load-bearing: `_ensure_loaded`
+# short-circuited on a non-empty registry, so importing one backend directly
+# hid the other permanently. That is fixed (a `_LOADED` flag now gates the
+# import instead of dict emptiness) and pinned by
+# `test_registry_survives_a_direct_backend_import`, which proves it in a fresh
+# interpreter where this line cannot mask the failure.
 importlib.import_module("symphony.agent.app_server")
 
 
@@ -1653,3 +1656,77 @@ async def test_real_claude_binary_end_to_end(tmp_path):  # pragma: no cover - co
     assert totals is not None
     assert totals[0] > 0 and totals[1] > 0
     assert completed.payload["cost"]["session_usd"] >= 0
+
+
+# --------------------------------------------------------------------------
+# Regressions for two defects found while testing this backend
+# --------------------------------------------------------------------------
+
+
+def test_registry_survives_a_direct_backend_import() -> None:
+    """Importing one backend must not hide the other (base.py `_LOADED`).
+
+    Registration is an *import side effect*, so a guard that tested
+    ``if _BACKENDS:`` short-circuited on a non-empty but incomplete registry.
+    That was production-reachable: ``workflow/config.py`` imports
+    ``symphony.agent.claude`` directly, so a ``codex`` workflow resolved after
+    that point failed with a misleading "unsupported agent.kind 'codex'".
+
+    Run in a fresh interpreter on purpose — this module already imports both
+    backends, so an in-process assertion could not fail.
+    """
+    probe = (
+        "import symphony.agent.claude;"
+        "from symphony.agent.base import backend_kinds, backend_spec;"
+        "print(','.join(backend_kinds()));"
+        "backend_spec('codex')"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert out.returncode == 0, f"backend_spec('codex') failed: {out.stderr[-400:]}"
+    assert out.stdout.strip() == "claude,codex"
+
+
+async def test_a_pre_init_banner_does_not_buy_the_turn_budget(tmp_path: Path) -> None:
+    """The startup budget applies until `system/init`, not until any line.
+
+    `claude` can print an update banner or a login warning before the init
+    event. Switching the deadline on "a line arrived" rather than on
+    `session.started` desynchronized the wait from the error: a hang after such
+    a line waited the full turn budget — an hour by default — and then raised
+    `ResponseTimeout` blaming `read_timeout_ms`.
+    """
+    script = "import time; print('WARNING: update available', flush=True); time.sleep(30)"
+    cfg = ClaudeConfig.from_mapping({"read_timeout_ms": 300, "turn_timeout_ms": 20_000})
+
+    async def spawn(*_args: object, **kw: object) -> object:
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdin=kw.get("stdin"),
+            stdout=kw.get("stdout"),
+            stderr=kw.get("stderr"),
+            cwd=kw.get("cwd"),
+            env=kw.get("env"),
+            limit=kw.get("limit", 65536),
+        )
+
+    client = ClaudeCodeClient(cfg, workspace=tmp_path, on_event=lambda _e: None, spawn=spawn)
+    session = await client.start_session()
+
+    started = time.monotonic()
+    with pytest.raises(ResponseTimeout) as caught:
+        await client.run_turn(session, "x")
+    waited_ms = (time.monotonic() - started) * 1000
+    await client.stop()
+
+    # The reported budget and the observed wait must agree. Before the fix this
+    # reported 300 and waited ~20000.
+    assert caught.value.details["timeout_ms"] == 300
+    assert waited_ms < 5_000, f"waited {waited_ms:.0f}ms against a 300ms startup budget"

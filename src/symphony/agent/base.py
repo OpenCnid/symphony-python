@@ -178,6 +178,18 @@ def build_agent_client(
     )
 
 
+#: Whether the bundled backends have been imported. This is a separate flag
+#: rather than a ``if _BACKENDS:`` emptiness test on purpose: registration is an
+#: *import side effect*, so any process that imports one backend module directly
+#: leaves the registry non-empty but incomplete. Testing emptiness would then
+#: short-circuit and hide every other backend permanently — and that is
+#: reachable in production, because ``workflow/config.py`` imports
+#: ``symphony.agent.claude`` directly to build its typed settings. A ``codex``
+#: workflow resolved after that point would fail with a misleading
+#: "unsupported agent.kind 'codex'" instead of launching.
+_LOADED = False
+
+
 def _ensure_loaded() -> None:
     """Import bundled backends for their registration side effect.
 
@@ -185,8 +197,11 @@ def _ensure_loaded() -> None:
     does not drag in every backend's dependencies, and so a backend that fails
     to import degrades to "unsupported kind" instead of breaking the package.
     """
-    if _BACKENDS:
+    global _LOADED
+    if _LOADED:
         return
+    _LOADED = True
+
     import importlib
 
     for module in ("symphony.agent.app_server", "symphony.agent.claude"):

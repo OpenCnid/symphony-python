@@ -526,19 +526,26 @@ class ClaudeCodeClient:
         """Read the NDJSON stream until the ``result`` event or a timeout."""
         stdout = proc.stdout
         assert stdout is not None
-        # `read_timeout_ms` bounds the wait for the *first* event (startup);
-        # `turn_timeout_ms` bounds silence thereafter and resets on any output.
-        deadline_ms = self.cfg.read_timeout_ms
+        # Two budgets, and the switch between them is keyed on `session.started`
+        # — the same condition the error branch reports on. Switching on "any
+        # line received" instead would desynchronize the two: `claude` can print
+        # an update banner or a login warning before `system/init`, and a hang
+        # after such a line would then wait the full turn budget (an hour by
+        # default) while raising ResponseTimeout blaming read_timeout_ms.
+        # Startup is not over until init arrives.
         finished = False
 
         while True:
+            deadline_ms = (
+                self.cfg.turn_timeout_ms if session.started else self.cfg.read_timeout_ms
+            )
             try:
                 raw = await asyncio.wait_for(stdout.readline(), timeout=deadline_ms / 1000)
             except TimeoutError as exc:
                 await self.stop()
                 if not session.started:
                     raise ResponseTimeout(
-                        "coding agent produced no output before read_timeout_ms",
+                        "coding agent did not start a session before read_timeout_ms",
                         timeout_ms=self.cfg.read_timeout_ms,
                     ) from exc
                 raise TurnTimeout(
@@ -549,7 +556,6 @@ class ClaudeCodeClient:
             if not raw:
                 break
 
-            deadline_ms = self.cfg.turn_timeout_ms
             event = self._decode(raw)
             if event is None:
                 continue
