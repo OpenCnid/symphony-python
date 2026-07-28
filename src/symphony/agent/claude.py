@@ -443,7 +443,7 @@ class ClaudeCodeClient:
     async def _attempt_turn(
         self, session: ClaudeSession, prompt: str, title: str | None
     ) -> None:
-        argv = self.build_argv(session, prompt)
+        argv = self.build_argv(session, prompt, title=title)
         env = self._child_env()
 
         try:
@@ -493,7 +493,9 @@ class ClaudeCodeClient:
 
     # -- argv --------------------------------------------------------------
 
-    def build_argv(self, session: ClaudeSession, prompt: str) -> list[str]:
+    def build_argv(
+        self, session: ClaudeSession, prompt: str, *, title: str | None = None
+    ) -> list[str]:
         """Compose the CLI invocation for one turn.
 
         The first turn pre-assigns the session id; later turns resume it. That
@@ -504,6 +506,12 @@ class ClaudeCodeClient:
         argv: list[str] = [resolve_claude(cfg.command)]
         argv += ["--print", prompt]
         argv += ["--output-format", "stream-json", "--verbose"]
+
+        # SPEC 10.2: include issue-identifying metadata where the targeted
+        # protocol supports a session title. Only on the opening turn — the
+        # name belongs to the session, and a resume would just re-set it.
+        if title and not session.started:
+            argv += ["--name", title]
 
         if session.started:
             argv += ["--resume", session.thread_id]

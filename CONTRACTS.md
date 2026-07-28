@@ -30,7 +30,10 @@ Each path has exactly one owner. Write only inside your own paths.
 | `src/symphony/workspace/manager.py` | 9.1, 9.2, 9.3 |
 | `src/symphony/workspace/safety.py` | 9.5, 15.2 |
 | `src/symphony/workspace/hooks.py` | 9.4, 15.4 |
-| `src/symphony/agent/app_server.py` | 10.1–10.3, 10.6 |
+| `src/symphony/agent/base.py` | Coding-agent backend abstraction + registry (`agent.kind`) |
+| `src/symphony/agent/app_server.py` | 10.1–10.3, 10.6 — `codex` backend |
+| `src/symphony/agent/claude.py` | 10.1–10.3, 10.6 — `claude` backend |
+| `src/symphony/agent/mcp_bridge.py` | 10.5, 11.5 — tracker tools for the `claude` backend |
 | `src/symphony/agent/events.py` | 10.4, 13.5 |
 | `src/symphony/agent/approvals.py` | 10.5 |
 | `src/symphony/agent/runner.py` | 10.7, 16.5 |
@@ -437,3 +440,50 @@ than by any one author:
    `_canonical_approval_decider`, which bridges `agent.approvals` to the
    app-server's flat `(approved, reason)` verdict. Without it the client uses a
    local copy of the posture and a policy swap silently has no effect.
+
+---
+
+## 7. Coding-agent backends
+
+`agent.kind` selects which coding agent runs the work. Both backends satisfy
+`symphony.agent.base.CodingAgentClient`, so `agent/runner.py` composes one way
+regardless of which is active.
+
+```python
+class CodingAgentClient(Protocol):
+    async def start_session(self) -> CodingAgentSession
+    async def run_turn(self, session, prompt, *, title: str | None = None) -> None
+    async def stop(self) -> None            # idempotent
+
+class CodingAgentSession(Protocol):
+    thread_id: str                          # stable for the session's lifetime
+    async def stop(self) -> None            # idempotent
+
+register_backend(AgentBackendSpec(kind, config_key, factory, description))
+build_agent_client(kind, agent_config, *, workspace, tool_specs, tool_executor,
+                   on_event, secret_env_names, approval_decider, **extra)
+backend_kinds() -> list[str]
+backend_spec(kind) -> AgentBackendSpec      # raises ConfigValidationError
+```
+
+Each backend owns its own front-matter block, named by `AgentBackendSpec.config_key`
+— `codex:` or `claude:` — so one workflow can carry both and switch with a single
+line. `ServiceConfig.agent_config` holds the typed settings for the *selected*
+backend, and `ServiceConfig.agent_timeouts` resolves `(turn, read, stall)` against
+it. Read stall detection through that property, never through `cfg.codex`
+directly, or a Claude run silently inherits the Codex block's timeout.
+
+Registration is an **import side effect** of each backend module. `base._LOADED`
+gates the bundled imports rather than testing `_BACKENDS` for emptiness: a
+process that imports one backend directly (as `workflow/config.py` does) would
+otherwise leave the registry populated but incomplete, permanently hiding the
+other.
+
+### Verification asymmetry, stated plainly
+
+The `claude` wire contract is **observed** — captured by running the binary and
+recorded in `docs/claude-protocol.md`. The `codex` `ProtocolNames` strings are
+**not**: no `codex` binary was available, so they follow documented conventions
+and its test suite generates the fake server's method table from the same object
+the client uses. That suite can be fully green while a real Codex session fails
+at startup. Treat the two backends' green suites as evidence of different things.
