@@ -359,9 +359,45 @@ class ClaudeCodeClient:
     async def run_turn(
         self, session: ClaudeSession, prompt: str, *, title: str | None = None
     ) -> None:
-        """Run one turn to termination (SPEC 10.3)."""
+        """Run one turn to termination (SPEC 10.3).
+
+        A cold client holding a *deterministic* session id cannot know whether
+        that conversation already exists — the id is derived from the issue
+        identifier, so an orchestrator restart produces the same id as the
+        original run. Claude Code rejects a reused ``--session-id`` outright::
+
+            Error: Session ID <uuid> is already in use.
+
+        so the first turn self-heals: on that specific failure it flips to
+        ``--resume`` and retries once. That is what makes a session actually
+        survive a restart rather than merely appearing to (SPEC 14.3 promises
+        no session recovery; this exceeds it, but only if the reconnect works).
+        """
         self._assert_workspace()
         session.turn_count += 1
+        try:
+            await self._attempt_turn(session, prompt, title)
+        except PortExit:
+            if session.started or not self._session_id_in_use():
+                raise
+            session.started = True
+            self._stderr_tail.clear()
+            await self._attempt_turn(session, prompt, title)
+
+    def _session_id_in_use(self) -> bool:
+        """Did the child reject a pre-assigned session id as already existing?
+
+        Matched on the message text because Claude Code emits it as plain
+        stderr rather than a protocol event, so there is no code to key on.
+        A wording change makes this return False, which degrades to the old
+        behavior (a failed attempt and an ordinary retry) rather than to
+        something unsafe.
+        """
+        return any("already in use" in line.lower() for line in self._stderr_tail)
+
+    async def _attempt_turn(
+        self, session: ClaudeSession, prompt: str, title: str | None
+    ) -> None:
         argv = self.build_argv(session, prompt)
         env = self._child_env()
 
@@ -385,6 +421,12 @@ class ClaudeCodeClient:
         try:
             await self._consume(proc, session, title)
         finally:
+            # Let stderr finish draining before tearing down. Cancelling it
+            # immediately races the diagnostics against the failure that needs
+            # them -- `_session_id_in_use` reads this buffer, and an empty
+            # buffer would silently disable the restart recovery above.
+            with suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(stderr_task), timeout=2)
             stderr_task.cancel()
             await self._reap(proc)
             self._proc = None
@@ -533,8 +575,13 @@ class ClaudeCodeClient:
         try:
             decoded = json.loads(text)
         except json.JSONDecodeError:
-            # `claude` can print non-protocol lines (warnings, MOTD). Surface
-            # and resync rather than failing the turn.
+            # `claude` can print non-protocol lines (warnings, startup errors).
+            # Surface and resync rather than failing the turn -- and keep the
+            # text in the diagnostics buffer, because fatal messages such as
+            # "Session ID ... is already in use." arrive this way rather than as
+            # a protocol event, and the restart recovery needs to read them.
+            self._stderr_tail.append(text)
+            del self._stderr_tail[:-50]
             self._emit("malformed", {"line": text[:400]})
             return None
         return decoded if isinstance(decoded, dict) else None
