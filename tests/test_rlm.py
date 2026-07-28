@@ -169,6 +169,12 @@ def test_system_map_is_stable_across_calls():
     assert first == second
 
 
+def test_signatures_carry_no_memory_addresses():
+    """Addresses change per process; a stable surface must not leak them."""
+    rendered = json.dumps(system_map(depth=2, max_chars=None))
+    assert " at 0x" not in rendered
+
+
 def test_absent_component_is_data_not_an_exception(fake_registry):
     fake_registry(
         ComponentSpec("symphony.orchestrator.core", "orchestrator", "poll loop", ("7", "8.1")),
@@ -270,6 +276,9 @@ def test_describe_state_indexes_runtime_without_duplicating_spec_13_3():
 
     rows = describe_state(state, depth=1, max_chars=None)
     assert rows["running"][0]["identifier"] == "ENG-101"
+    # SPEC 7.2 phases subclass ``str``; the result must hold a plain str, not
+    # the enum member, or a caller reading the dict sees `<RunPhase.X: 'x'>`.
+    assert type(rows["running"][0]["phase"]) is str
     assert rows["running"][0]["phase"] == "StreamingTurn"
     assert rows["running"][0]["turn_count"] == 3
     assert "recent_events" not in rows["running"][0]
@@ -312,6 +321,7 @@ def test_jsonable_survives_hostile_values():
     coerced = jsonable(payload)
     strict_json(coerced)
     assert coerced["phase"] == "Failed"
+    assert type(coerced["phase"]) is str
     assert coerced["nan"] == "nan"
     assert coerced["raw"] == {"__bytes__": 2}
 

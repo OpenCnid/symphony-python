@@ -13,6 +13,7 @@ Time is fully injected. There are no wall-clock sleeps.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -191,6 +192,11 @@ class FakeWorkspaces:
         self.error: BaseException | None = None
 
     async def cleanup(self, identifier: str) -> bool:
+        # A real WorkspaceManager does filesystem work through asyncio.to_thread,
+        # so cleanup yields to the event loop. Modelling that is what lets
+        # cancelled workers actually settle mid-tick.
+        for _ in range(3):
+            await asyncio.sleep(0)
         if self.error is not None:
             raise self.error
         self.cleaned.append(identifier)
@@ -460,7 +466,7 @@ async def test_start_continues_when_terminal_fetch_fails():
 async def test_start_fails_when_startup_validation_fails():
     harness = build_harness()
     harness.validator.error = RuntimeError("codex.command missing")
-    with pytest.raises(RuntimeError, match="codex.command missing"):
+    with pytest.raises(RuntimeError, match=re.escape("codex.command missing")):
         await harness.orch.start(initial_tick=False)
     assert not harness.orch.started
     # SPEC 6.3: startup validation runs before startup cleanup.
@@ -624,6 +630,35 @@ async def test_dispatch_clears_pending_retry_entry_and_cancels_its_timer(h: Harn
     assert "a" not in h.state.retry_attempts
     assert retry_timer.cancelled or retry_timer not in h.clock.timers
     assert h.state.running["a"].retry_attempt == 1
+
+
+async def test_dispatch_removes_any_pending_retry_entry_and_orphans_no_timer(h: Harness):
+    """SPEC 16.4 ends with ``state.retry_attempts.remove(issue.id)``.
+
+    Driven white-box through :meth:`Orchestrator.invoke` because the two
+    production callers each already consume the retry entry; the removal exists
+    so no code path can leave a live timer pointing at a running issue.
+    """
+    issue = make_issue("a", identifier="ENG-A")
+
+    def prime(orch: Orchestrator):
+        orch.schedule_retry("a", 3, identifier="ENG-A", error="stale")
+        return orch.state.retry_attempts["a"].timer_handle
+
+    timer = await h.orch.invoke(prime)
+    assert timer in h.clock.pending
+
+    await h.orch.invoke(lambda orch: orch._dispatch_issue(issue, 3))
+
+    assert "a" not in h.state.retry_attempts
+    assert timer.cancelled
+    assert h.state.running["a"].retry_attempt == 3
+
+    # The dead timer must not resurrect anything when its deadline passes.
+    h.clock.advance(120_000)
+    await h.orch.drain()
+    assert h.state.running["a"].worker_handle is not None
+    assert h.runner.started == [("a", 3)]
 
 
 async def test_failed_spawn_schedules_a_retry_and_holds_the_claim(h: Harness):
@@ -799,6 +834,27 @@ async def test_retry_timer_requeues_with_explicit_error_when_slots_are_exhausted
     assert h.state.claimed == {"a", "b"}
 
 
+async def test_retry_timer_requeues_when_only_the_per_state_slot_is_full(h: Harness):
+    """SPEC 8.3 — global slots free is not enough; the per-state limit also binds."""
+    h.config.max_concurrent_agents = 5
+    h.config.max_concurrent_agents_by_state = {"todo": 1}
+    issue_a = make_issue("a", identifier="ENG-A")
+    await _queue_retry(h, issue_a)
+    h.tracker.by_id = {"a": issue_a}
+
+    await dispatch(h, make_issue("b", state="Todo", identifier="ENG-B"))
+    assert h.state.running_count() == 1
+    assert spec_available_slots(h.state, h.config) == 4  # global slots remain
+
+    h.clock.advance(10_000)
+    await h.orch.drain()
+
+    entry = h.state.retry_attempts["a"]
+    assert entry.attempt == 2
+    assert entry.error == "no available orchestrator slots"
+    assert h.runner.started == [("a", None), ("b", None)]
+
+
 async def test_retry_timer_requeues_when_the_id_refresh_fails(h: Harness):
     await _queue_retry(h, make_issue("a", identifier="ENG-A"))
     h.tracker.id_error = RuntimeError("tracker 500")
@@ -893,7 +949,8 @@ async def test_reconcile_refresh_failure_keeps_workers_running(h: Harness):
 
     assert "a" in h.state.running
     assert h.state.claimed == {"a"}
-    assert "state refresh failed; keep workers running" in h.log.messages("debug")
+    # Wording belongs to symphony.orchestrator.reconcile, which owns SPEC 8.5.
+    assert "reconciliation state refresh failed; keeping workers running" in h.log.messages("debug")
 
 
 async def test_stall_detection_terminates_and_queues_a_retry(h: Harness):
@@ -908,7 +965,8 @@ async def test_stall_detection_terminates_and_queues_a_retry(h: Harness):
     assert h.workspaces.cleaned == []
     entry = h.state.retry_attempts["a"]
     assert entry.attempt == 1
-    assert entry.error.startswith("stalled: no agent activity for")
+    # Wording belongs to symphony.orchestrator.reconcile, which owns SPEC 8.5 Part A.
+    assert "stall" in entry.error.lower() or "no coding-agent activity" in entry.error
     assert h.state.claimed == {"a"}
     await asyncio.gather(worker, return_exceptions=True)
     assert worker.cancelled()
@@ -920,9 +978,7 @@ async def test_stall_clock_restarts_from_the_last_agent_event(h: Harness):
     h.tracker.by_id = {"a": make_issue("a", identifier="ENG-A")}
 
     h.clock.advance(50_000)
-    h.orch.report_agent_event(
-        "a", FakeAgentEvent(event="turn_completed", timestamp=h.clock.now())
-    )
+    h.orch.report_agent_event("a", FakeAgentEvent(event="turn_completed", timestamp=h.clock.now()))
     await h.orch.drain()
 
     h.clock.advance(50_000)
@@ -1131,6 +1187,39 @@ async def test_injected_reconciler_replaces_the_builtin_and_drives_public_mutato
         await harness.orch.stop()
 
 
+async def test_stale_exit_does_not_kill_the_worker_that_replaced_it(h: Harness):
+    """SPEC 16.6 — a worker exit is matched by task identity, not by issue id.
+
+    Reconciliation terminates the run and releases the claim, the *same* tick
+    re-dispatches the issue, and only then does the cancelled worker's exit
+    reach the mailbox. Without the identity check that stale exit would delete
+    the healthy replacement and schedule a bogus retry.
+    """
+    candidate = make_issue("a", identifier="ENG-A", state="Todo")
+    await dispatch(h, candidate)
+    first_worker = h.state.running["a"].worker_handle
+
+    # Terminal in the tracker (so reconcile stops it) but still a live candidate
+    # in the same tick's state query (so dispatch picks it straight back up).
+    h.tracker.by_id = {"a": make_issue("a", state="Done", identifier="ENG-A")}
+    h.tracker.by_state = [candidate]
+
+    await h.orch.tick()
+
+    second_worker = h.state.running["a"].worker_handle
+    assert second_worker is not first_worker
+    assert h.workspaces.cleaned == ["ENG-A"]
+    assert h.runner.started == [("a", None), ("a", None)]
+
+    await asyncio.gather(first_worker, return_exceptions=True)
+    await settle(h)
+
+    assert h.state.running["a"].worker_handle is second_worker
+    assert not second_worker.done()
+    assert h.state.retry_attempts == {}
+    assert h.state.claimed == {"a"}
+
+
 async def test_report_agent_event_defers_mutation_until_drained(h: Harness):
     await dispatch(h, make_issue("a", identifier="ENG-A"))
     h.orch.report_agent_event("a", FakeAgentEvent(event="turn_completed", timestamp=EPOCH))
@@ -1197,3 +1286,58 @@ async def test_stop_cancels_timers_and_workers():
     assert harness.clock.pending == []
     assert worker.cancelled()
     assert not harness.orch.started
+
+
+# --------------------------------------------------------------------------
+# Reconciliation ownership (CONTRACTS ownership map, SPEC 8.5 / 16.3)
+#
+# SPEC 8.5 was briefly implemented twice -- once here and once in
+# symphony.orchestrator.reconcile -- which is exactly the kind of duplication
+# that drifts silently. These pin the delegation so it cannot come back.
+# --------------------------------------------------------------------------
+
+
+async def test_the_default_reconciler_delegates_to_the_reconcile_module(h: Harness):
+    from symphony.orchestrator.core import module_reconciler
+
+    assert h.orch.reconciler is module_reconciler
+
+
+async def test_an_explicit_none_selects_the_built_in_fallback(h: Harness):
+    from symphony.orchestrator.core import Orchestrator
+
+    orch = Orchestrator(
+        config=h.config,
+        tracker=h.tracker,
+        runner=h.orch.runner,
+        workspaces=h.workspaces,
+        reconciler=None,
+        validate=h.orch._validate,
+        clock=h.clock,
+        logger=h.log,
+    )
+    assert orch.reconciler is None
+
+
+async def test_reconciliation_actually_runs_through_the_module(h: Harness):
+    """The delegation is load-bearing, not just a wired-up attribute."""
+    import symphony.orchestrator.reconcile as reconcile_module
+
+    calls: list[str] = []
+    original = reconcile_module.reconcile_running_issues
+
+    async def spy(state, **kwargs):
+        calls.append("reconcile_running_issues")
+        return await original(state, **kwargs)
+
+    # Dispatch first: it ticks, and that tick would be counted too.
+    await dispatch(h, make_issue("a", identifier="ENG-A"))
+    h.tracker.by_state = []
+
+    reconcile_module.reconcile_running_issues = spy
+    try:
+        await h.orch.tick()
+    finally:
+        reconcile_module.reconcile_running_issues = original
+
+    assert calls == ["reconcile_running_issues"]

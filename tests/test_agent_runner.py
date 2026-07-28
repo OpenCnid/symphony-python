@@ -147,6 +147,8 @@ class FakeAppServerClient:
         self.tool_specs: list[ToolSpec] = kwargs["tool_specs"]
         self.tool_executor = kwargs["tool_executor"]
         self.on_event = kwargs["on_event"]
+        self.secret_env_names: tuple[str, ...] = tuple(kwargs.get("secret_env_names", ()))
+        self.approval_decider = kwargs.get("approval_decider")
         self.turns: list[tuple[str, str | None, Any]] = []
         self.session: FakeSession | None = None
 
@@ -177,6 +179,9 @@ class FakeTracker:
         self.harness = harness
         self.refresh_calls: list[list[str]] = []
         self.tool_calls: list[tuple[str, dict[str, Any], Any]] = []
+        # SPEC 15.3: every real adapter declares the environment names holding
+        # tracker credentials, so the launcher can strip them from the child.
+        self.secret_env_names: list[str] = ["FAKE_TRACKER_TOKEN"]
 
     async def fetch_issues_by_ids(self, issue_ids: list[str]) -> list[Issue]:
         self.refresh_calls.append(list(issue_ids))
@@ -189,6 +194,9 @@ class FakeTracker:
 
     def agent_tool_specs(self) -> list[ToolSpec]:
         return list(self.harness.tool_specs)
+
+    def secret_environment_names(self) -> list[str]:
+        return list(self.secret_env_names)
 
     async def execute_agent_tool(
         self, name: str, arguments: dict[str, Any], context: Any
@@ -797,3 +805,63 @@ async def test_runner_never_removes_the_workspace(ws: Path) -> None:
 
     assert marker.read_text(encoding="utf-8") == "kept"
     assert "before_remove" not in h.hooks.names
+
+
+# --------------------------------------------------------------------------
+# Credential isolation and approval-policy composition (SPEC 15.3, 10.5)
+#
+# These belong here rather than in the app-server suite because they are
+# composition steps. The adapter declares the secret names and the client
+# strips them, but only the runner stands in both scopes -- so nothing else
+# in the system can catch a regression that disconnects the two halves.
+# --------------------------------------------------------------------------
+
+
+async def test_tracker_secret_env_names_reach_the_app_server_launcher(ws: Path) -> None:
+    h = Harness(workspace_path=ws)
+    h.tracker.secret_env_names = ["LINEAR_API_KEY", "GITHUB_TOKEN"]
+
+    await h.run()
+
+    assert h.client.secret_env_names == ("LINEAR_API_KEY", "GITHUB_TOKEN")
+
+
+async def test_an_adapter_declaring_no_secrets_strips_nothing(ws: Path) -> None:
+    h = Harness(workspace_path=ws)
+    h.tracker.secret_env_names = []
+
+    await h.run()
+
+    assert h.client.secret_env_names == ()
+
+
+async def test_the_canonical_approval_policy_reaches_the_client(ws: Path) -> None:
+    h = Harness(workspace_path=ws)
+
+    await h.run()
+
+    decider = h.client.approval_decider
+    assert decider is not None, "the runner must supply the canonical approval policy"
+
+    # The documented posture (CONTRACTS section 5, SPEC 10.5): command
+    # execution is auto-approved for the session; user input is a hard failure.
+    assert decider("thread/execCommandApproval", {"command": ["ls"]}).approved is True
+    assert decider("thread/applyPatchApproval", {"changes": {}}).approved is True
+    assert decider("thread/userInput", {"prompt": "which branch?"}).approved is False
+
+
+async def test_a_policy_swap_changes_what_the_runner_hands_the_client(ws: Path) -> None:
+    from symphony.agent.approvals import DENY_ALL, set_approval_policy
+
+    h = Harness(workspace_path=ws)
+    previous = set_approval_policy(DENY_ALL)
+    try:
+        await h.run()
+        decider = h.client.approval_decider
+        assert decider is not None
+        # The whole point of routing through symphony.agent.approvals rather
+        # than the client's local copy: a deployment-level posture change is
+        # actually observed at the transport boundary.
+        assert decider("thread/execCommandApproval", {"command": ["ls"]}).approved is False
+    finally:
+        set_approval_policy(previous)

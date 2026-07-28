@@ -110,7 +110,7 @@ def size(payload: Any) -> dict[str, Any]:
     text = as_text(payload)
     items: int | None
     try:
-        items = len(payload)  # type: ignore[arg-type]
+        items = len(payload)
     except TypeError:
         items = None
     return {

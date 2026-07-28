@@ -249,8 +249,11 @@ def create_app(
         except Exception as exc:  # SPEC 14.2: dashboard failures must not crash
             html = render_error_page(f"{type(exc).__name__}: {exc}")
             status = 503
-        body = "" if method == "HEAD" else html
-        return HTMLResponse(body, status_code=status)
+        response = HTMLResponse(html, status_code=status)
+        if method == "HEAD":
+            # RFC 7231: HEAD keeps the Content-Length GET would have sent.
+            response.body = b""
+        return response
 
     async def api_endpoint(request: Request) -> Response:
         """SPEC 13.7.2 dispatch. See :func:`symphony.http.api.api_target`."""

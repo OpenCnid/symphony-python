@@ -342,14 +342,19 @@ async def test_state_backfills_the_baseline_keys_from_a_partial_snapshot() -> No
     assert body["generated_at"] == "2026-02-24T20:15:30Z"
 
 
-async def test_head_on_state_keeps_the_status_and_drops_the_body(
-    provider: FakeProvider,
+@pytest.mark.parametrize("path", ["/api/v1/state", "/api/v1/MT-649", "/"])
+async def test_head_keeps_the_status_and_length_but_drops_the_body(
+    path: str, provider: FakeProvider
 ) -> None:
+    """RFC 7231: HEAD advertises the Content-Length GET would have sent."""
     async with make_client(create_app(provider.as_source())) as client:
-        response = await client.head("/api/v1/state")
+        head = await client.head(path)
+        get = await client.get(path)
 
-    assert response.status_code == 200
-    assert response.content == b""
+    assert head.status_code == get.status_code == 200
+    assert head.content == b""
+    assert head.headers["content-length"] == get.headers["content-length"]
+    assert int(head.headers["content-length"]) > 0
 
 
 # ==========================================================================

@@ -31,6 +31,12 @@ whole process tree instead -- a Windows Job Object with
 ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``, or a POSIX process group -- and then
 drains the pipe, which also confirms no descendant survived holding it.
 
+A consequence worth stating for ``WORKFLOW.md`` authors: completion is defined
+by EOF on the hook's stdout, so a hook that backgrounds a long-lived process
+without redirecting its output (``mydaemon &``) keeps the pipe open, is treated
+as a timeout, and is killed with its child. Such hooks must redirect:
+``mydaemon >/dev/null 2>&1 &``.
+
 Shell selection
 ---------------
 SPEC 9.4 names ``sh -lc <script>`` as the POSIX-conforming default (with
@@ -166,7 +172,7 @@ def _is_windows_system_launcher(path: str) -> bool:
     workspace ``cwd`` contract in SPEC 9.4 would silently not hold. Skip it and
     keep looking for a real MSYS/Cygwin shell.
     """
-    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    root = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR") or r"C:\Windows"
     try:
         resolved = os.path.normcase(os.path.abspath(path))
     except (OSError, ValueError):  # pragma: no cover - defensive
@@ -301,9 +307,7 @@ class _WindowsJob:
     def assign(self, pid: int) -> None:
         import ctypes
 
-        hproc = self._k32.OpenProcess(
-            self._PROCESS_TERMINATE | self._PROCESS_SET_QUOTA, False, pid
-        )
+        hproc = self._k32.OpenProcess(self._PROCESS_TERMINATE | self._PROCESS_SET_QUOTA, False, pid)
         if not hproc:
             raise OSError(ctypes.get_last_error(), "OpenProcess failed")
         try:
@@ -323,7 +327,7 @@ class _WindowsJob:
 
 def _job_limit_struct(ctypes: Any, wt: Any) -> Any:
     class IoCounters(ctypes.Structure):
-        _fields_ = [
+        _fields_ = [  # noqa: RUF012 - ctypes ABI
             (n, ctypes.c_ulonglong)
             for n in (
                 "ReadOperationCount",
@@ -336,7 +340,7 @@ def _job_limit_struct(ctypes: Any, wt: Any) -> Any:
         ]
 
     class BASIC(ctypes.Structure):
-        _fields_ = [
+        _fields_ = [  # noqa: RUF012 - ctypes ABI
             ("PerProcessUserTimeLimit", ctypes.c_longlong),
             ("PerJobUserTimeLimit", ctypes.c_longlong),
             ("LimitFlags", wt.DWORD),
@@ -349,7 +353,7 @@ def _job_limit_struct(ctypes: Any, wt: Any) -> Any:
         ]
 
     class EXTENDED(ctypes.Structure):
-        _fields_ = [
+        _fields_ = [  # noqa: RUF012 - ctypes ABI
             ("BasicLimitInformation", BASIC),
             ("IoInfo", IoCounters),
             ("ProcessMemoryLimit", ctypes.c_size_t),
@@ -514,7 +518,9 @@ class HookRunner:
         """
         script = self.script_for(name)
         if script is None:
-            return HookOutcome(name=name, status="skipped", exit_code=None, duration_ms=0, output="")
+            return HookOutcome(
+                name=name, status="skipped", exit_code=None, duration_ms=0, output=""
+            )
 
         timeout_ms = self.timeout_ms
         argv = self.shell.argv(script)
@@ -691,9 +697,7 @@ class HookRunner:
         holds the inherited stdout handle; if one did, this would time out.
         """
         try:
-            raw, _ = await asyncio.wait_for(
-                asyncio.shield(communicate), timeout=_DRAIN_TIMEOUT_S
-            )
+            raw, _ = await asyncio.wait_for(asyncio.shield(communicate), timeout=_DRAIN_TIMEOUT_S)
         except (TimeoutError, OSError, ValueError):
             communicate.cancel()
             with contextlib.suppress(BaseException):

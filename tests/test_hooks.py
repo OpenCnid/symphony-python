@@ -161,16 +161,12 @@ def reaper():
         if not pid_alive(pid):
             continue
         if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)], capture_output=True, check=False
-            )
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, check=False)
         else:  # pragma: no cover - POSIX cleanup
             import signal
 
-            try:
+            with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
 
 
 async def read_grandchild_pid(ws: Path, timeout_s: float = 20.0) -> int:
@@ -239,8 +235,11 @@ def test_contract_signature_is_preserved() -> None:
     init = inspect.signature(HookRunner.__init__).parameters
     assert list(init)[:2] == ["self", "cfg"]
     assert init["cfg"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    assert all(p.default is not inspect.Parameter.empty for n, p in init.items() if n
-               not in ("self", "cfg"))
+    assert all(
+        p.default is not inspect.Parameter.empty
+        for n, p in init.items()
+        if n not in ("self", "cfg")
+    )
 
     run = inspect.signature(HookRunner.run).parameters
     assert list(run) == ["self", "name", "cwd", "fatal"]
@@ -398,9 +397,7 @@ async def test_fatal_failure_carries_hook_name_cwd_and_output(tmp_path: Path) ->
 @requires_posix_shell
 async def test_non_fatal_failure_does_not_prevent_the_next_hook(tmp_path: Path) -> None:
     """SPEC 9.4: before_remove failure is ignored and cleanup still proceeds."""
-    runner = make_runner(
-        before_remove="exit 9", after_run="touch after_run.marker; exit 0"
-    )
+    runner = make_runner(before_remove="exit 9", after_run="touch after_run.marker; exit 0")
     assert await runner.run("before_remove", tmp_path, fatal=False) is None
     await runner.run("after_run", tmp_path, fatal=False)
     assert (tmp_path / "after_run.marker").exists()
@@ -545,9 +542,7 @@ def test_resolve_prefers_sh_then_bash_with_login_c() -> None:
         ("-lc",),
         True,
     )
-    only_bash = resolve_hook_shell(
-        which={"bash": "/usr/bin/bash"}.get, os_name="posix"
-    )
+    only_bash = resolve_hook_shell(which={"bash": "/usr/bin/bash"}.get, os_name="posix")
     assert (only_bash.kind, only_bash.args) == ("bash", ("-lc",))
 
 
@@ -573,7 +568,7 @@ def test_windows_falls_back_to_comspec_only_without_a_posix_shell() -> None:
 @windows_only
 def test_wsl_interop_launcher_is_never_selected_as_the_posix_shell() -> None:
     """``System32\\bash.exe`` runs in a different mount namespace, so cwd would lie."""
-    root = os.environ.get("SystemRoot", r"C:\Windows")
+    root = os.environ.get("SYSTEMROOT", r"C:\Windows")
     shell = resolve_hook_shell(
         which={"bash": os.path.join(root, "System32", "bash.exe")}.get,
         os_name="nt",

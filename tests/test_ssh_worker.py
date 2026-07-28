@@ -123,14 +123,16 @@ class FakeProcess:
         self.stdout = FakeStream()
         self.stderr = FakeStream()
         self.terminated = False
+        self._exited = asyncio.Event()
 
     async def wait(self) -> int:
-        await asyncio.sleep(3600)
-        return 0
+        await self._exited.wait()
+        return self.returncode if self.returncode is not None else 0
 
     def terminate(self) -> None:
         self.terminated = True
         self.returncode = -15
+        self._exited.set()
 
     def kill(self) -> None:
         self.terminate()
@@ -354,12 +356,18 @@ def test_build_remote_command_rejects_tokens_that_do_not_round_trip() -> None:
         build_remote_command([])
 
 
-def test_build_remote_command_emits_only_whitelisted_operators() -> None:
-    """A token that looks like an operator but is data must stay quoted."""
-    line = build_remote_command(["echo", "||", "&&"])
-    assert shlex.split(line) == ["echo", "||", "&&"]
-    assert "'||'" in line  # data
-    assert " && " in line  # operator, unquoted
+def test_a_data_token_spelled_like_an_operator_is_still_quoted() -> None:
+    """Operator-ness is carried by type, not text, so data cannot become syntax."""
+    line = build_remote_command(["echo", "&&", "||", ";"])
+    assert shlex.split(line) == ["echo", "&&", "||", ";"]
+    assert "'&&'" in line and "'||'" in line and "';'" in line
+    assert " && " not in line  # no unquoted operator was emitted
+
+
+def test_generated_launch_line_contains_exactly_one_real_operator() -> None:
+    line = build_remote_launch_command(f"{ROOT}/ABC-1", "codex app-server")
+    assert line.count(" && ") == 1
+    assert "'&&'" not in line
 
 
 def test_launch_command_rejects_a_path_that_escapes_before_quoting() -> None:
@@ -376,7 +384,7 @@ def test_probe_command_is_pure_data_and_checks_writability() -> None:
     line = build_remote_probe_command(f"{ROOT}/ABC-1", ROOT)
     tokens = shlex.split(line)
     assert tokens.count("pwd") == 2 and tokens.count("-P") == 2
-    assert ["test", "-w", "."] == tokens[4:7]
+    assert tokens[4:7] == ["test", "-w", "."]
     assert "$" not in line and "`" not in line  # no substitutions to verify around
 
 
@@ -827,6 +835,46 @@ async def test_remote_client_accepts_a_contained_workspace() -> None:
         make_assignment(), tool_specs=[], tool_executor=lambda *_: None, on_event=lambda _e: None
     )
     client._assert_launch_cwd()  # must not raise
+
+
+async def test_start_session_drives_the_whole_remote_launch_path() -> None:
+    """End-to-end through the inherited SPEC 10.2 startup, over the fake transport.
+
+    Proves the wiring rather than the seam: ``start_session`` runs the remote
+    Invariant 1 check, builds the remote command via ``launch_argv``, spawns it
+    through the transport, and then maps the silent remote to a SPEC 10.6 error.
+    """
+    transport = FakeTransport()
+    cfg = FakeServiceConfig(ssh_hosts=("build-1",), codex=FakeCodexConfig(read_timeout_ms=10))
+    worker = SSHWorker(cfg, transport=transport)  # type: ignore[arg-type]
+    client = worker.app_server_client(
+        make_assignment(), tool_specs=[], tool_executor=lambda *_: None, on_event=lambda _e: None
+    )
+    with pytest.raises(ResponseTimeout):
+        await client.start_session()
+
+    host_spec, command, _env = transport.spawn_calls[0]
+    assert host_spec == "build-1"
+    assert shlex.split(command)[2] == f"{ROOT}/ABC-1"
+    assert transport.processes[0].terminated is True  # session lifecycle stays local
+
+
+async def test_start_session_refuses_an_escaping_workspace_before_spawning() -> None:
+    """Invariant 1 must fail closed: no ssh process is started at all."""
+    transport = FakeTransport()
+    worker, _ = make_worker(transport=transport)
+    bad = HostAssignment(
+        host=SSHHost.parse("build-1"),
+        issue_identifier="ABC-1",
+        workspace_path=PurePosixPath("/tmp/elsewhere"),
+        remote_root=PurePosixPath(ROOT),
+    )
+    client = worker.app_server_client(
+        bad, tool_specs=[], tool_executor=lambda *_: None, on_event=lambda _e: None
+    )
+    with pytest.raises(InvalidWorkspaceCwd):
+        await client.start_session()
+    assert transport.spawn_calls == []
 
 
 async def test_spawn_failure_surfaces_as_a_connect_stage_error() -> None:

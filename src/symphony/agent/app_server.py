@@ -117,6 +117,13 @@ __all__ = [
 # and field names, and edit only this dataclass. Nothing outside this block
 # spells a protocol string, so no lifecycle or timeout logic needs to move.
 # Callers may also pass `protocol=ProtocolNames(...)` to pin a version.
+#
+# ONE ASSUMPTION LIVES OUTSIDE THIS BLOCK: the wire *framing*. This client
+# speaks newline-delimited JSON-RPC 2.0 (one JSON object per line). That is a
+# transport shape, not a name, so it cannot be expressed as a constant. If the
+# targeted version uses length-prefixed framing (`Content-Length` headers)
+# instead, exactly two methods change — `AppServerClient._read_stdout` and
+# `AppServerClient._write` — and nothing else in the lifecycle is affected.
 
 
 @dataclass(frozen=True, slots=True)

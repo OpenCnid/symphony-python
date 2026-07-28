@@ -291,6 +291,51 @@ def _lazy_validate(config: Any) -> None:
     module.validate_dispatch_config(config)
 
 
+class _Unset:
+    """Sentinel distinguishing "no reconciler given" from an explicit ``None``."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
+async def module_reconciler(orch: Orchestrator) -> None:
+    """Default reconciler: delegate SPEC 8.5 / 16.3 to ``orchestrator.reconcile``.
+
+    CONTRACTS.md assigns the SPEC 8.5 branch table to
+    ``symphony.orchestrator.reconcile``, so that module owns the *decision* and
+    this orchestrator owns the *mutation*. The bridge below is the whole seam:
+    ``reconcile`` threads a ``state`` argument through its callbacks because it
+    is written as a pure planner over any state, while this orchestrator holds
+    exactly one state and ignores the parameter.
+
+    Running here means running inside the mailbox task, so driving the public
+    mutators keeps the SPEC 7 sole-mutator invariant intact.
+    """
+    reconcile = importlib.import_module("symphony.orchestrator.reconcile")
+
+    def _terminate(_state: Any, issue_id: str, **kw: Any) -> Any:
+        return orch.terminate_running_issue(issue_id, **kw)
+
+    def _retry(_state: Any, issue_id: str, **kw: Any) -> Any:
+        attempt = kw.pop("attempt")
+        return orch.schedule_retry(issue_id, attempt, **kw)
+
+    await reconcile.reconcile_running_issues(
+        orch.state,
+        cfg=orch.config,
+        tracker=orch.tracker,
+        deps=reconcile.ReconcileDeps(
+            terminate_running_issue=_terminate,
+            schedule_retry=_retry,
+            now=orch.clock.now,
+            logger=orch.log,
+        ),
+    )
+
+
 # --------------------------------------------------------------------------
 # Small helpers
 # --------------------------------------------------------------------------
@@ -353,7 +398,7 @@ class Orchestrator:
         runner: AgentRunnerLike,
         workspaces: WorkspaceCleaner,
         deps: OrchestratorDeps | None = None,
-        reconciler: Callable[[Orchestrator], Any] | None = None,
+        reconciler: Callable[[Orchestrator], Any] | _Unset | None = _UNSET,
         validate: Callable[[Any], None] | None = None,
         clock: Clock | None = None,
         logger: Any | None = None,
@@ -362,7 +407,11 @@ class Orchestrator:
         self.tracker = tracker
         self.runner = runner
         self.workspaces = workspaces
-        self.reconciler = reconciler
+        # Omitted -> delegate to symphony.orchestrator.reconcile, which owns the
+        # SPEC 8.5 branch table. Explicit None -> use the built-in fallback.
+        self.reconciler: Callable[[Orchestrator], Any] | None = (
+            module_reconciler if isinstance(reconciler, _Unset) else reconciler
+        )
         self.deps = deps if deps is not None else OrchestratorDeps.load()
         self.clock: Clock = clock if clock is not None else AsyncioClock()
         self.log = logger if logger is not None else _default_logger()
@@ -651,7 +700,6 @@ class Orchestrator:
                 category = getattr(exc, "category", None)
                 phase = RunPhase.TIMED_OUT if category in _TIMEOUT_CATEGORIES else RunPhase.FAILED
                 normal, reason = False, _describe(exc)
-        self.state.running.pop(issue_id, None)
         self._mailbox.put_nowait(
             _WorkerExit(issue_id=issue_id, task=task, normal=normal, reason=reason, phase=phase)
         )
@@ -842,26 +890,15 @@ class Orchestrator:
     async def _reconcile_running_issues(self) -> None:
         """SPEC 16.3, called first on every tick (SPEC 7.4, 8.1).
 
-        When :attr:`reconciler` is set it replaces this built-in entirely. It is
-        awaited from inside the mailbox task, so it may drive the public
-        mutators :meth:`terminate_running_issue` and :meth:`schedule_retry`
-        without breaking the SPEC 7 sole-mutator invariant. That is the seam for
-        ``symphony.orchestrator.reconcile``, for which CONTRACTS.md defines no
-        signature; a host wires it with, for example::
+        The default reconciler is :func:`module_reconciler`, which delegates the
+        SPEC 8.5 branch table to ``symphony.orchestrator.reconcile`` — the module
+        CONTRACTS.md assigns those sections to. The fallback below stays as a
+        self-contained implementation for hosts that inject ``reconciler=None``
+        explicitly, and as the reference the delegating path is checked against.
 
-            async def reconcile(orch):
-                await reconcile_running_issues(
-                    orch.state, cfg=orch.config, tracker=orch.tracker,
-                    deps=ReconcileDeps(
-                        terminate_running_issue=lambda state, issue_id, **kw: (
-                            orch.terminate_running_issue(issue_id, **kw)
-                        ),
-                        schedule_retry=lambda state, issue_id, **kw: (
-                            orch.schedule_retry(issue_id, kw.pop("attempt"), **kw)
-                        ),
-                        now=orch.clock.now,
-                    ),
-                )
+        Either way the work runs inside the mailbox task and mutates only
+        through :meth:`terminate_running_issue` and :meth:`schedule_retry`, so
+        the SPEC 7 sole-mutator invariant holds.
         """
         if self.reconciler is not None:
             result = self.reconciler(self)

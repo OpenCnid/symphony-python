@@ -20,13 +20,14 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from typing import Any
 
 import pytest
 
 from symphony import cli
 from symphony.errors import ConfigValidationError, MissingWorkflowFile, TrackerRequestError
+from symphony.models import OrchestratorState
 
 # --------------------------------------------------------------------------
 # Fakes
@@ -126,27 +127,43 @@ class FakeTracker:
 
 
 class FakeOrchestrator:
-    """Stand-in for ``orchestrator.core`` — only the four methods the host calls."""
+    """Stand-in for ``orchestrator.core.Orchestrator`` — the lifecycle the host uses.
 
-    def __init__(self, rec: Recorder, config: Any, state: Any, tracker: Any) -> None:
+    Mirrors the real module: ``start()`` performs the SPEC 16.1 tail (preflight,
+    SPEC 8.6 terminal cleanup, first tick), ``run_forever()`` awaits the loop,
+    ``stop()`` unwinds it, and ``apply_config()`` re-applies a reload.
+    """
+
+    def __init__(self, rec: Recorder, config: Any, workflow: Any, tracker: Any) -> None:
         self.rec = rec
         self.config = config
-        self.state = state
+        self.workflow = workflow
         self.tracker = tracker
+        self.state = OrchestratorState(
+            poll_interval_ms=config.poll_interval_ms,
+            max_concurrent_agents=config.max_concurrent_agents,
+        )
 
+        self.start_error: BaseException | None = None
         self.run_error: BaseException | None = None
         self.run_returns_unasked = False
-        self.cleanup_error: BaseException | None = None
         self.stop_error: BaseException | None = None
         self.ignore_stop = False
         self.on_run: Any = None
 
+        self.started = False
         self.stop_called = False
         self.reloaded: list[Any] = []
         self.run_started = asyncio.Event()
         self._release = asyncio.Event()
 
-    async def run(self) -> None:
+    async def start(self) -> None:
+        self.rec.steps.append("orchestrator_start")
+        if self.start_error is not None:
+            raise self.start_error
+        self.started = True
+
+    async def run_forever(self) -> None:
         self.rec.steps.append("run")
         self.run_started.set()
         if self.run_error is not None:
@@ -165,14 +182,9 @@ class FakeOrchestrator:
         if not self.ignore_stop:
             self._release.set()
 
-    async def reload(self, config: Any) -> None:
-        self.rec.steps.append("reload")
+    async def apply_config(self, config: Any) -> None:
+        self.rec.steps.append("apply_config")
         self.reloaded.append(config)
-
-    async def startup_terminal_workspace_cleanup(self) -> None:
-        self.rec.steps.append("cleanup")
-        if self.cleanup_error is not None:
-            raise self.cleanup_error
 
 
 class Recorder:
@@ -185,6 +197,7 @@ class Recorder:
         self.observability: FakeObservability | None = None
         self.tracker: FakeTracker | None = None
         self.orchestrator: FakeOrchestrator | None = None
+        self.reader: cli.SnapshotReader | None = None
         self.snapshot_calls = 0
 
     def messages(self, level: str | None = None) -> list[str]:
@@ -261,7 +274,7 @@ def make_deps(
         return watcher
 
     async def start_observability(
-        config: Any, port_override: int | None, snapshot: Any
+        config: Any, port_override: int | None, reader: cli.SnapshotReader
     ) -> FakeObservability | None:
         rec.steps.append("start_observability")
         if observability_error is not None:
@@ -269,20 +282,25 @@ def make_deps(
         port = port_override if port_override is not None else config.server_port
         if port is None:
             return None
-        # Prove the host handed over a working late-bound snapshot callable.
-        snapshot()
+        rec.reader = reader
+        # Prove the host handed over working late-bound observability reads.
+        reader.snapshot()
+        reader.issue_detail("ENG-1")
         rec.observability = FakeObservability(rec, port)
         return rec.observability
 
-    def build_orchestrator(config: Any, state: Any, tracker: Any) -> FakeOrchestrator:
+    def build_orchestrator(config: Any, workflow: Any, tracker: Any) -> FakeOrchestrator:
         rec.steps.append("build_orchestrator")
-        rec.orchestrator = FakeOrchestrator(rec, config, state, tracker)
+        rec.orchestrator = FakeOrchestrator(rec, config, workflow, tracker)
         rec.orchestrator.run_returns_unasked = not run_blocks
         return rec.orchestrator
 
     def build_snapshot(state: Any) -> dict[str, Any]:
         rec.snapshot_calls += 1
         return {"running": len(state.running)}
+
+    def build_issue_detail(state: Any, identifier: str) -> dict[str, Any]:
+        return {"identifier": identifier, "running": len(state.running)}
 
     return cli.HostDeps(
         configure_logging=configure_logging,
@@ -295,6 +313,7 @@ def make_deps(
         start_observability=start_observability,
         build_orchestrator=build_orchestrator,
         build_snapshot=build_snapshot,
+        build_issue_detail=build_issue_detail,
     )
 
 
@@ -485,8 +504,8 @@ def test_run_exits_zero_on_sigint(workflow: Path, rec: Recorder) -> None:
     outer_build = deps.build_orchestrator
     assert outer_build is not None
 
-    def build(config: Any, state: Any, tracker: Any) -> FakeOrchestrator:
-        orch = outer_build(config, state, tracker)
+    def build(config: Any, workflow_defn: Any, tracker: Any) -> FakeOrchestrator:
+        orch = outer_build(config, workflow_defn, tracker)
 
         async def raise_sigint() -> None:
             signal.raise_signal(signal.SIGINT)
@@ -569,8 +588,8 @@ def test_abnormal_host_exit_exits_nonzero(workflow: Path, rec: Recorder) -> None
     outer_build = deps.build_orchestrator
     assert outer_build is not None
 
-    def build(config: Any, state: Any, tracker: Any) -> FakeOrchestrator:
-        orch = outer_build(config, state, tracker)
+    def build(config: Any, workflow_defn: Any, tracker: Any) -> FakeOrchestrator:
+        orch = outer_build(config, workflow_defn, tracker)
         orch.run_error = RuntimeError("tick loop crashed")
         return orch
 
@@ -586,8 +605,8 @@ def test_loop_returning_without_a_shutdown_request_exits_nonzero(
     outer_build = deps.build_orchestrator
     assert outer_build is not None
 
-    def build(config: Any, state: Any, tracker: Any) -> FakeOrchestrator:
-        orch = outer_build(config, state, tracker)
+    def build(config: Any, workflow_defn: Any, tracker: Any) -> FakeOrchestrator:
+        orch = outer_build(config, workflow_defn, tracker)
         orch.run_returns_unasked = True
         return orch
 
@@ -627,7 +646,7 @@ async def test_startup_runs_spec_16_1_steps_in_order(workflow: Path, rec: Record
             "validate",
             "build_adapter",
             "build_orchestrator",
-            "cleanup",
+            "orchestrator_start",
         ]
     finally:
         await host.aclose()
@@ -769,10 +788,10 @@ async def test_reload_apply_failure_does_not_crash_the_host(
     try:
         assert rec.orchestrator is not None
 
-        async def failing_reload(_config: Any) -> None:
+        async def failing_apply(_config: Any) -> None:
             raise RuntimeError("cannot rebind")
 
-        rec.orchestrator.reload = failing_reload  # type: ignore[method-assign]
+        rec.orchestrator.apply_config = failing_apply  # type: ignore[method-assign]
         await host.reload_workflow()
 
         assert "workflow reload could not be applied to live behavior" in rec.messages("error")
@@ -799,9 +818,14 @@ async def test_change_arriving_before_the_orchestrator_exists_only_updates_confi
 # ==========================================================================
 
 
-async def test_cleanup_runs_after_validation_and_before_the_first_tick(
+async def test_spec_16_1_tail_is_delegated_before_the_first_tick(
     workflow: Path, rec: Recorder
 ) -> None:
+    """``orchestrator.start()`` carries SPEC 16.1's tail, including SPEC 8.6 cleanup.
+
+    The host's obligation is ordering: the fatal preflight first, then the
+    delegated tail, and only then the run loop.
+    """
     host = await cli.start_service(str(workflow), deps=make_deps(rec), grace_seconds=5.0)
     try:
         serving = asyncio.ensure_future(host.serve())
@@ -812,33 +836,34 @@ async def test_cleanup_runs_after_validation_and_before_the_first_tick(
     finally:
         await host.aclose()
 
-    assert rec.steps.index("validate") < rec.steps.index("cleanup") < rec.steps.index("run")
+    assert (
+        rec.steps.index("validate")
+        < rec.steps.index("orchestrator_start")
+        < rec.steps.index("run")
+    )
+    assert rec.orchestrator.started is True
 
 
-async def test_cleanup_failure_is_a_warning_not_a_startup_failure(
-    workflow: Path, rec: Recorder
-) -> None:
-    """SPEC 8.6 step 3: log a warning and continue startup."""
-    deps = make_deps(rec)
+def test_orchestrator_start_failure_fails_startup(workflow: Path, rec: Recorder) -> None:
+    """The delegated tail re-runs the SPEC 6.3 preflight, so its failure is fatal.
+
+    SPEC 8.6 cleanup failures are swallowed inside ``orchestrator.start()``
+    (they are warnings there); anything that still escapes is a startup failure
+    and must not be downgraded to a running-but-broken service.
+    """
+    deps = make_deps(rec, run_blocks=False)
     outer_build = deps.build_orchestrator
     assert outer_build is not None
 
-    def build(config: Any, state: Any, tracker: Any) -> FakeOrchestrator:
-        orch = outer_build(config, state, tracker)
-        orch.cleanup_error = TrackerRequestError("terminal-issue fetch failed")
+    def build(config: Any, workflow_defn: Any, tracker: Any) -> FakeOrchestrator:
+        orch = outer_build(config, workflow_defn, tracker)
+        orch.start_error = ConfigValidationError("preflight failed on the second look")
         return orch
 
     deps.build_orchestrator = build
 
-    host = await cli.start_service(str(workflow), deps=deps)  # must not raise
-    try:
-        assert host.orchestrator is not None
-        fields = rec.fields_for("startup terminal workspace cleanup failed")
-        assert fields["category"] == "tracker_request"
-    finally:
-        await host.aclose()
-
-    assert "startup terminal workspace cleanup failed" in rec.messages("warning")
+    assert cli.run(str(workflow), deps=deps) == cli.EXIT_STARTUP_FAILURE
+    assert rec.orchestrator is not None and rec.orchestrator.started is False
 
 
 # ==========================================================================
@@ -904,6 +929,24 @@ async def test_observability_failure_does_not_fail_startup(workflow: Path, rec: 
         await host.aclose()
 
 
+async def test_the_dashboard_gets_the_hosts_own_live_reads(
+    workflow: Path, rec: Recorder
+) -> None:
+    """Both SPEC 13.7.2 reads must resolve against this host, not a stub.
+
+    Handing observability a placeholder for either one yields a dashboard that
+    renders but always reports nothing, which no smoke test would notice.
+    """
+    deps = make_deps(rec, config=FakeConfig(server_port=0))
+    host = await cli.start_service(str(workflow), deps=deps)
+    try:
+        assert rec.reader is not None
+        assert rec.reader.snapshot() == host.snapshot()
+        assert rec.reader.issue_detail("ENG-7") == {"identifier": "ENG-7", "running": 0}
+    finally:
+        await host.aclose()
+
+
 async def test_snapshot_is_late_bound_and_survives_a_failing_builder(
     workflow: Path, rec: Recorder
 ) -> None:
@@ -943,67 +986,139 @@ def _install_fake_module(
     return module
 
 
-def _fake_http_server(calls: list[dict[str, Any]]) -> ModuleType:
-    module = ModuleType("symphony.http.server")
+class _FakeHttpServer:
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.started = False
+        self.stopped = False
 
-    async def start_server(*, port: int, snapshot: Any) -> Any:
-        calls.append({"port": port, "snapshot": snapshot})
+    async def start(self) -> None:
+        self.started = True
 
-        async def stop() -> None:
-            return None
-
-        return SimpleNamespace(port=port, stop=stop)
-
-    module.start_server = start_server  # type: ignore[attr-defined]
-    return module
+    async def stop(self) -> None:
+        self.stopped = True
 
 
-async def test_default_observability_stays_off_without_a_port(
+def _capture_build_http_server(
+    monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]], *, enabled: bool = True
+) -> None:
+    """Intercept the real ``build_http_server`` to record what the CLI passes it."""
+    import symphony.http.server as http_server
+
+    def fake_build(source: Any, **kwargs: Any) -> Any:
+        calls.append({"source": source, **kwargs})
+        return _FakeHttpServer(kwargs.get("cli_port") or 0) if enabled else None
+
+    monkeypatch.setattr(http_server, "build_http_server", fake_build)
+
+
+async def test_default_observability_delegates_port_precedence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[dict[str, Any]] = []
-    _install_fake_module(monkeypatch, "symphony.http.server", _fake_http_server(calls))
+    """SPEC 13.7's precedence rule has one owner: ``http.server.resolve_port``.
 
-    handle = await cli._default_start_observability(FakeConfig(server_port=None), None, dict)
-
-    assert handle is None
-    assert calls == []  # the extension module must not even be imported
-
-
-async def test_default_observability_uses_server_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[dict[str, Any]] = []
-    _install_fake_module(monkeypatch, "symphony.http.server", _fake_http_server(calls))
-
-    handle = await cli._default_start_observability(FakeConfig(server_port=1234), None, dict)
-
-    assert handle is not None and handle.port == 1234
-    assert calls[0]["port"] == 1234
-
-
-async def test_default_observability_lets_cli_port_win(monkeypatch: pytest.MonkeyPatch) -> None:
-    """SPEC 13.7: 'CLI --port overrides server.port when both are present.'"""
-    calls: list[dict[str, Any]] = []
-    _install_fake_module(monkeypatch, "symphony.http.server", _fake_http_server(calls))
-
-    await cli._default_start_observability(FakeConfig(server_port=1234), 8787, dict)
-
-    assert calls[0]["port"] == 8787
-
-
-async def test_default_observability_honors_cli_port_zero(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """SPEC 13.7: '0 requests an ephemeral port.'
-
-    Zero is falsy, so an override test that only ever uses truthy ports would
-    pass against a ``port_override or config.server_port`` implementation.
+    The CLI's obligation is to hand both sources over unmodified — in
+    particular not to collapse a ``--port 0`` into "absent" on the way.
     """
     calls: list[dict[str, Any]] = []
-    _install_fake_module(monkeypatch, "symphony.http.server", _fake_http_server(calls))
+    _capture_build_http_server(monkeypatch, calls)
+    reader = cli.SnapshotReader(snapshot=dict, issue_detail=lambda _i: None)
 
-    await cli._default_start_observability(FakeConfig(server_port=1234), 0, dict)
+    await cli._default_start_observability(FakeConfig(server_port=1234), 0, reader)
 
-    assert calls[0]["port"] == 0
+    assert calls[0]["cli_port"] == 0
+    assert calls[0]["config_port"] == 1234
+
+
+async def test_default_observability_passes_a_none_cli_port_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    _capture_build_http_server(monkeypatch, calls)
+    reader = cli.SnapshotReader(snapshot=dict, issue_detail=lambda _i: None)
+
+    await cli._default_start_observability(FakeConfig(server_port=8080), None, reader)
+
+    assert calls[0]["cli_port"] is None
+    assert calls[0]["config_port"] == 8080
+
+
+async def test_default_observability_starts_the_server_it_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    _capture_build_http_server(monkeypatch, calls)
+    reader = cli.SnapshotReader(snapshot=dict, issue_detail=lambda _i: None)
+
+    handle = await cli._default_start_observability(FakeConfig(), 8787, reader)
+
+    assert isinstance(handle, _FakeHttpServer)
+    assert handle.started is True
+
+
+async def test_default_observability_returns_none_when_not_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``build_http_server`` returning ``None`` is the normal disabled result."""
+    calls: list[dict[str, Any]] = []
+    _capture_build_http_server(monkeypatch, calls, enabled=False)
+    reader = cli.SnapshotReader(snapshot=dict, issue_detail=lambda _i: None)
+
+    assert await cli._default_start_observability(FakeConfig(), None, reader) is None
+
+
+async def test_default_observability_hands_over_both_live_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dashboard needs SPEC 13.7.2's snapshot *and* per-issue detail."""
+    calls: list[dict[str, Any]] = []
+    _capture_build_http_server(monkeypatch, calls)
+    reader = cli.SnapshotReader(
+        snapshot=lambda: {"ok": True},
+        issue_detail=lambda identifier: {"identifier": identifier},
+    )
+
+    await cli._default_start_observability(FakeConfig(), 0, reader)
+
+    source = calls[0]["source"]
+    assert source.snapshot() == {"ok": True}
+    assert source.issue_detail("ENG-7") == {"identifier": "ENG-7"}
+
+
+async def test_default_observability_composes_with_the_real_http_extension(
+    workflow: Path, rec: Recorder
+) -> None:
+    """Integration: the real ``build_http_server`` binds an ephemeral loopback port.
+
+    Everything above stubs the extension out, which would let a signature drift
+    between this module and ``symphony.http`` go unnoticed. Port ``0`` keeps the
+    bind local and free (SPEC 13.7).
+    """
+    deps = make_deps(rec)
+    deps.start_observability = None  # use the real resolver
+
+    host = await cli.start_service(str(workflow), port=0, deps=deps)
+    try:
+        assert host.observability is not None
+        assert host.observability.port > 0  # an ephemeral port was actually bound
+    finally:
+        await host.aclose()
+
+
+def test_default_logging_prefers_the_shipped_configure_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``observability.logging`` names it ``configure``; that must win."""
+    module = ModuleType("symphony.observability.logging")
+    order: list[str] = []
+    module.configure = lambda: order.append("configure")  # type: ignore[attr-defined]
+    module.configure_logging = lambda: order.append("configure_logging")  # type: ignore[attr-defined]
+    _install_fake_module(monkeypatch, "symphony.observability.logging", module)
+
+    monkeypatch.setattr(cli, "_basic_stderr_logging", lambda: order.append("fallback"))
+    cli._default_configure_logging()
+
+    assert order == ["configure"]
 
 
 def test_default_logging_uses_the_observability_entry_point(
@@ -1062,7 +1177,7 @@ async def test_aclose_unwinds_in_reverse_startup_order(workflow: Path, rec: Reco
     host = await cli.start_service(str(workflow), deps=deps)
     rec.steps.clear()
     await host.aclose()
-    assert rec.steps == ["close_tracker", "stop_watch", "stop_observability"]
+    assert rec.steps == ["stop", "close_tracker", "stop_watch", "stop_observability"]
 
 
 async def test_aclose_is_idempotent(workflow: Path, rec: Recorder) -> None:

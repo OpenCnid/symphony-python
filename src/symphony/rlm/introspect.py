@@ -39,7 +39,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import PurePath
 from types import ModuleType
-from typing import Any
+from typing import Any, TypeVar, get_origin
 
 __all__ = [
     "DEFAULT_MAX_CHARS",
@@ -69,6 +69,14 @@ MAX_REPR_CHARS = 240
 """Fallback ``repr()`` renderings are cut to this many characters."""
 
 _ROOT_PACKAGE = "symphony"
+
+_ADDRESS_RE = re.compile(r" at 0x[0-9a-fA-F]+")
+"""Matches the ``<object at 0x7f...>`` suffix CPython puts in default reprs.
+
+The address changes every process, so leaving it in would make two otherwise
+identical introspection results compare unequal across runs. Callers rely on
+this surface being stable, so it is stripped everywhere text is rendered.
+"""
 
 
 # --------------------------------------------------------------------------
@@ -231,6 +239,7 @@ def _repr_of(value: Any) -> str:
         text = repr(value)
     except Exception as exc:  # a broken __repr__ must not break introspection
         text = f"<unreprable {type(value).__name__}: {type(exc).__name__}>"
+    text = _ADDRESS_RE.sub("", text)
     return text if len(text) <= MAX_REPR_CHARS else text[: MAX_REPR_CHARS - 3] + "..."
 
 
@@ -243,14 +252,18 @@ def jsonable(value: Any, *, depth: int = 8) -> Any:
     """
     if depth <= 0:
         return _repr_of(value)
+    # Enums first: SPEC 7.1/7.2 enums subclass ``str``, so an isinstance(str)
+    # check would return the *member* rather than its value. That still
+    # serializes, but leaves a `<RunPhase.X: 'x'>` repr in the live dict and
+    # makes results compare unequal to the plain strings callers match on.
+    if isinstance(value, enum.Enum):
+        return jsonable(value.value, depth=depth - 1)
     if value is None or isinstance(value, bool | int):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else repr(value)
     if isinstance(value, str):
         return value
-    if isinstance(value, enum.Enum):
-        return jsonable(value.value, depth=depth - 1)
     if isinstance(value, datetime | date):
         return value.isoformat()
     if isinstance(value, PurePath):
@@ -337,9 +350,12 @@ def _finalize(payload: dict[str, Any], max_chars: int | None) -> dict[str, Any]:
 
         measure_json(result) == result["_meta"]["chars"]
     """
-    result = jsonable(payload)
-    if not isinstance(result, dict):  # pragma: no cover - callers always pass dicts
-        result = {"kind": "value", "value": result}
+    coerced = jsonable(payload)
+    result: dict[str, Any] = (
+        coerced
+        if isinstance(coerced, dict)
+        else {"kind": "value", "value": coerced}  # pragma: no cover
+    )
     truncated = False
     if max_chars is not None and measure_json(result) > max_chars:
         truncated = True
@@ -422,13 +438,19 @@ def _summary(obj: Any) -> str | None:
 
 
 def _signature(obj: Any) -> str | None:
+    """Render a call signature, with memory addresses stripped (see _ADDRESS_RE)."""
     try:
-        return str(inspect.signature(obj))
+        rendered = str(inspect.signature(obj))
     except (TypeError, ValueError):
         return None
+    return _ADDRESS_RE.sub("", rendered)
 
 
 def _kind(obj: Any) -> str:
+    if get_origin(obj) is not None:
+        return "type_alias"
+    if isinstance(obj, TypeVar):
+        return "type_var"
     if inspect.isclass(obj):
         if issubclass(obj, enum.Enum):
             return "enum"
@@ -509,6 +531,9 @@ def _class_internals(obj: type) -> dict[str, Any]:
 def _symbol_entry(name: str, obj: Any, depth: int) -> dict[str, Any]:
     entry: dict[str, Any] = {"symbol": name, "kind": _kind(obj)}
     if depth < 2:
+        return entry
+    if entry["kind"] in {"type_alias", "type_var"}:
+        entry["alias"] = _repr_of(obj)
         return entry
     if entry["kind"] == "constant":
         # A module-level constant has no docstring of its own at runtime; its
@@ -806,7 +831,8 @@ def describe_state(
     if not _looks_like_orchestrator_state(state):
         return describe_object(state, depth=depth, max_chars=max_chars)
 
-    totals = getattr(state, "codex_totals", None)
+    totals: Any = getattr(state, "codex_totals", None)
+    to_dict = getattr(totals, "to_dict", None)
     payload: dict[str, Any] = {
         "kind": "runtime_state",
         "type": type(state).__name__,
@@ -820,7 +846,7 @@ def describe_state(
             "poll_interval_ms": getattr(state, "poll_interval_ms", None),
             "max_concurrent_agents": getattr(state, "max_concurrent_agents", None),
         },
-        "codex_totals": totals.to_dict() if hasattr(totals, "to_dict") else jsonable(totals),
+        "codex_totals": to_dict() if callable(to_dict) else jsonable(totals),
         "rate_limits_present": getattr(state, "codex_rate_limits", None) is not None,
         "note": "SPEC 13.3 dashboard shape: symphony.observability.snapshot.build_snapshot(state)",
     }
@@ -896,15 +922,8 @@ def find_symbol(
         for name in _public_names(module):
             if not rx.search(name):
                 continue
-            obj = getattr(module, name)
             matches.append(
-                {
-                    "module": comp.module,
-                    "symbol": name,
-                    "kind": _kind(obj),
-                    "signature": _signature(obj),
-                    "doc": _summary(obj),
-                }
+                {"module": comp.module, **_symbol_entry(name, getattr(module, name), 2)}
             )
     truncated = len(matches) > max_results
     payload = {

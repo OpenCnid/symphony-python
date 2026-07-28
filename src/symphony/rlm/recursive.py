@@ -422,9 +422,10 @@ def recursive_query(
             record({"kind": "skipped", "depth": depth, "reason": blocked, "chars": len(body)})
             return ""
         ledger.spend(tokens, depth)
-        answer = model(query, body)
-        if not isinstance(answer, str):
-            answer = str(answer)
+        # The sub-model is injected and unverified; coerce rather than trust the
+        # annotation, since a deployment client can return anything.
+        returned: Any = model(query, body)
+        answer = returned if isinstance(returned, str) else str(returned)
         record(
             {
                 "kind": kind,

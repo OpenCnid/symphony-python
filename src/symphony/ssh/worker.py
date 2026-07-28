@@ -1324,8 +1324,14 @@ class RemoteAppServerClient(AppServerClient):
             spawn=_make_remote_spawn(assignment, transport, cfg),
             **kwargs,
         )
-        # Must follow super().__init__, which normalizes to a local Path.
-        self.workspace = assignment.workspace_path
+        # Must follow super().__init__, which normalizes to a local Path. The
+        # deliberate type variance (PurePosixPath where the base declares Path)
+        # is the whole point: the base only ever calls str() on this attribute,
+        # and a local Path would render POSIX remote paths with backslashes on a
+        # Windows orchestrator. PurePosixPath also has no filesystem methods,
+        # which makes an accidental local existence check a type error rather
+        # than a silently wrong answer about a remote directory.
+        self.workspace = assignment.workspace_path  # type: ignore[assignment]
         self.assignment = assignment
         self.transport = transport
 

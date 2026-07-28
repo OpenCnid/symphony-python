@@ -26,7 +26,7 @@ stops that session first. See :data:`EXIT_PATHS` for the machine-readable table.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -153,6 +153,8 @@ class TrackerLike(Protocol):
 
     def agent_tool_specs(self) -> list[ToolSpec]: ...
 
+    def secret_environment_names(self) -> list[str]: ...
+
     async def execute_agent_tool(
         self, name: str, arguments: dict[str, Any], context: ToolContext
     ) -> ToolResult: ...
@@ -192,6 +194,8 @@ class AppServerFactory(Protocol):
         tool_specs: list[ToolSpec],
         tool_executor: ToolExecutor,
         on_event: Callable[[AgentEvent], None],
+        secret_env_names: Sequence[str] = (),
+        approval_decider: Callable[[str, Mapping[str, Any]], Any] | None = None,
     ) -> AppServerClientLike: ...
 
 
@@ -229,6 +233,29 @@ EventSink = Callable[[str, "AgentEvent"], None]
 # --------------------------------------------------------------------------
 
 
+def _canonical_approval_decider(method: str, params: Mapping[str, Any]) -> Any:
+    """Bridge :mod:`symphony.agent.approvals` to the app-server's decider shape.
+
+    The two modules speak different vocabularies on purpose. ``approvals``
+    models the SPEC 10.5 *posture* — a swappable policy over
+    ``ApprovalKind -> ApprovalDecision`` — while ``app_server`` needs a flat
+    ``(approved, reason)`` verdict it can translate to whatever the targeted
+    protocol calls that field. This adapter is the seam, so a deployment can
+    swap the policy (``approvals.set_approval_policy(DENY_ALL)``) without
+    touching the transport.
+
+    Without this wiring the client falls back to its own local copy of the
+    posture, and a policy swap silently has no effect.
+    """
+    from symphony.agent.app_server import ApprovalDecision as WireDecision
+    from symphony.agent.approvals import decide_approval
+
+    request: dict[str, Any] = {"method": method}
+    request.update(params)
+    decision = decide_approval(request)
+    return WireDecision(approved=bool(decision.is_approval), reason=str(decision.value))
+
+
 def _default_app_server_factory(
     cfg: CodexConfig,
     *,
@@ -236,6 +263,8 @@ def _default_app_server_factory(
     tool_specs: list[ToolSpec],
     tool_executor: ToolExecutor,
     on_event: Callable[[AgentEvent], None],
+    secret_env_names: Sequence[str] = (),
+    approval_decider: Callable[[str, Mapping[str, Any]], Any] | None = None,
 ) -> AppServerClientLike:
     from symphony.agent.app_server import AppServerClient
 
@@ -245,6 +274,8 @@ def _default_app_server_factory(
         tool_specs=tool_specs,
         tool_executor=tool_executor,
         on_event=on_event,
+        secret_env_names=secret_env_names,
+        approval_decider=approval_decider or _canonical_approval_decider,
     )
 
 
@@ -413,12 +444,20 @@ class AgentRunner:
         # SPEC 16.5 exit 3. From here on before_run has succeeded, so every
         # remaining exit path owes an after_run.
         try:
+            # SPEC 15.3 / 10.5: the adapter declares which environment names
+            # hold tracker credentials, and the launcher removes them from the
+            # child environment. The child receives tool *results*, never a raw
+            # token. This is the only place the two halves meet -- the adapter
+            # cannot strip what it does not launch, and the client cannot know
+            # which names matter without being told.
             client = self._app_server_factory(
                 self._config.codex,
                 workspace=workspace_path,
                 tool_specs=list(self._tracker.agent_tool_specs()),
                 tool_executor=self._make_tool_executor(ctx),
                 on_event=self._make_event_sink(issue.id, log),
+                secret_env_names=tuple(self._tracker.secret_environment_names()),
+                approval_decider=_canonical_approval_decider,
             )
             session = await client.start_session()
         except BaseException as exc:

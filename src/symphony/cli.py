@@ -5,15 +5,15 @@ sequence, signal-driven shutdown, and the exit code. It owns no orchestration
 policy — the poll/dispatch tick (SPEC 16.2-16.4, 16.6) belongs to
 ``symphony.orchestrator.core``.
 
-Two properties shape the design:
+Three properties shape the design:
 
 **The 16.1 ordering is load-bearing.** Logging and the observability outputs come
 up *before* dispatch preflight validation runs, so that a validation failure is
 visible to an operator through the surfaces the spec requires (SPEC 13.2:
 startup/validation failures MUST be visible without attaching a debugger). The
 watch starts before validation for the same reason: an operator who boots with a
-broken ``WORKFLOW.md`` should be able to fix the file, and the process that
-reports the failure should already have been watching it.
+broken ``WORKFLOW.md`` should be able to fix it in place, and the process that
+reports the failure should already have been watching the file.
 
 **Startup validation is fatal; every later validation failure is not.** SPEC 6.3
 splits these explicitly: startup validation failure MUST fail startup, while
@@ -21,18 +21,21 @@ per-tick validation failure only skips dispatch and keeps reconciliation alive
 (SPEC 14.2). SPEC 6.2 pushes the same way for reloads — an invalid reload MUST
 NOT crash the service and MUST keep the last known good config. So exactly one
 validation call in this module is fatal (:meth:`ServiceHost.start`), and the
-reload path (:meth:`ServiceHost.reload_workflow`) deliberately does not validate
+reload path (:meth:`ServiceHost.reload_workflow`) deliberately never validates
 fatally at all.
 
-Startup terminal workspace cleanup (SPEC 8.6) runs after validation and before
-the first tick, and its failure is a logged warning rather than a startup
-failure.
+**SPEC 16.1's tail belongs to the orchestrator.** CONTRACTS.md assigns 16.1-16.4
+to ``orchestrator.core``, whose ``start()`` performs the preflight re-validation,
+the SPEC 8.6 startup terminal workspace cleanup, and ``schedule_tick(0)``. The
+host therefore owns steps 1-4 and the fatal gate, then delegates the tail. That
+keeps SPEC 8.6's "log a warning and continue" next to the tracker and workspace
+manager that implement it, instead of duplicating the rule here.
 
 RLM note: ``main`` is a thin wrapper. The startup sequence is
 :func:`start_service`, which returns a live :class:`ServiceHost`; a model driving
 this system from a Python REPL can ``await start_service(...)``, inspect
-``host.state`` and ``host.config``, and ``await host.aclose()`` without ever
-spawning a subprocess.
+``host.state``, ``host.config``, and ``host.orchestrator``, and
+``await host.aclose()`` without ever spawning a subprocess.
 """
 
 from __future__ import annotations
@@ -50,7 +53,6 @@ from typing import Any, Protocol
 
 from symphony import __version__
 from symphony.errors import MissingWorkflowFile, SymphonyError
-from symphony.models import OrchestratorState
 
 __all__ = [
     "EXIT_OK",
@@ -59,6 +61,7 @@ __all__ = [
     "EXIT_USAGE",
     "HostDeps",
     "ServiceHost",
+    "SnapshotReader",
     "build_parser",
     "install_signal_handlers",
     "main",
@@ -95,31 +98,30 @@ PROGRAM_NAME = "symphony"
 # --------------------------------------------------------------------------
 # Collaborator protocols
 #
-# CONTRACTS.md fixes the signatures of workflow.loader, workflow.config,
-# workflow.watcher, trackers.base and observability.logging, and this module
-# uses those verbatim. It does *not* fix a surface for orchestrator.core,
-# http.server, or an observability "start outputs" entry point, so the minimum
-# this host needs from each is stated here and resolved lazily in HostDeps.
+# CONTRACTS.md section 3 fixes the signatures of workflow.loader,
+# workflow.config, workflow.watcher, trackers.base and observability, and this
+# module uses those verbatim. It does not fix one for orchestrator.core or
+# http.server, so the minimum the host needs is stated here and matched to the
+# shipped modules in the ``_default_*`` resolvers below.
 # --------------------------------------------------------------------------
 
 
 class Orchestrator(Protocol):
-    """What the host requires of ``symphony.orchestrator.core`` (SPEC 16.2-16.4)."""
+    """What the host requires of ``symphony.orchestrator.core.Orchestrator``."""
 
-    async def run(self) -> None:
-        """Run the tick loop (SPEC 16.1 ``schedule_tick(0)`` + ``event_loop``).
+    state: Any
 
-        Returns only after :meth:`stop`. Returning unasked is an abnormal exit.
-        """
+    async def start(self) -> None:
+        """SPEC 16.1 tail: preflight, SPEC 8.6 cleanup, and ``schedule_tick(0)``."""
+
+    async def run_forever(self) -> None:
+        """Await the tick loop. Returns only after :meth:`stop`."""
 
     async def stop(self) -> None:
         """Stop accepting new dispatches and let in-flight work unwind."""
 
-    async def reload(self, config: Any) -> None:
-        """Re-apply a newly loaded :class:`ServiceConfig` to live behavior (SPEC 6.2)."""
-
-    async def startup_terminal_workspace_cleanup(self) -> None:
-        """Remove workspaces for terminal issues (SPEC 8.6). Failure is non-fatal."""
+    async def apply_config(self, config: Any) -> None:
+        """Re-apply a reloaded ``ServiceConfig`` to live behavior (SPEC 6.2)."""
 
 
 class Watcher(Protocol):
@@ -131,9 +133,22 @@ class Watcher(Protocol):
 
 
 class ObservabilityHandle(Protocol):
-    """A started observability output that the host must later shut down."""
+    """A started observability output the host must later shut down."""
 
     async def stop(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotReader:
+    """The two late-bound reads handed to observability (SPEC 13.3, 13.7.2).
+
+    Observability starts before the orchestrator exists (SPEC 16.1), so the
+    dashboard cannot be handed a live ``OrchestratorState``. It gets these
+    callables instead, which resolve against the host on every request.
+    """
+
+    snapshot: Callable[[], Any]
+    issue_detail: Callable[[str], Any]
 
 
 # --------------------------------------------------------------------------
@@ -147,8 +162,8 @@ class HostDeps:
 
     Each field defaults to ``None``, meaning "resolve the real sibling module on
     first use". Lazy resolution is not stylistic: it keeps ``import symphony.cli``
-    free of import-time coupling to modules that may be absent, half-written, or
-    (for the HTTP server) an optional extension the operator never enabled.
+    free of import-time coupling to the whole system, so ``--version`` and
+    ``--help`` work even when an optional extension is unimportable.
 
     Tests replace fields directly; nothing here reaches the filesystem, the
     network, or a subprocess by itself.
@@ -162,10 +177,11 @@ class HostDeps:
     build_adapter: Callable[..., Any] | None = None
     build_watcher: Callable[[Path, Callable[[], Awaitable[None]]], Watcher] | None = None
     start_observability: (
-        Callable[[Any, int | None, Callable[[], Any]], Awaitable[ObservabilityHandle | None]] | None
+        Callable[[Any, int | None, SnapshotReader], Awaitable[ObservabilityHandle | None]] | None
     ) = None
-    build_orchestrator: Callable[[Any, OrchestratorState, Any], Orchestrator] | None = None
-    build_snapshot: Callable[[OrchestratorState], Any] | None = None
+    build_orchestrator: Callable[[Any, Any, Any], Orchestrator] | None = None
+    build_snapshot: Callable[[Any], Any] | None = None
+    build_issue_detail: Callable[[Any, str], Any] | None = None
 
     # -- resolution ------------------------------------------------------
 
@@ -203,7 +219,9 @@ class HostDeps:
     def resolved_build_adapter(self) -> Callable[..., Any]:
         if self.build_adapter is not None:
             return self.build_adapter
-        from symphony.trackers.base import build_adapter
+        # Importing the package (not just ``base``) is what registers the
+        # bundled adapters, so ``tracker.kind`` resolves for a bare WORKFLOW.md.
+        from symphony.trackers import build_adapter
 
         return build_adapter
 
@@ -214,38 +232,36 @@ class HostDeps:
 
         return WorkflowWatcher
 
-    def resolved_build_orchestrator(self) -> Callable[[Any, OrchestratorState, Any], Orchestrator]:
-        if self.build_orchestrator is not None:
-            return self.build_orchestrator
-        from symphony.orchestrator.core import Orchestrator as _Orchestrator
-
-        def factory(config: Any, state: OrchestratorState, tracker: Any) -> Orchestrator:
-            return _Orchestrator(config=config, state=state, tracker=tracker)
-
-        return factory
+    def resolved_build_orchestrator(self) -> Callable[[Any, Any, Any], Orchestrator]:
+        return self.build_orchestrator or _default_build_orchestrator
 
     def resolved_start_observability(
         self,
-    ) -> Callable[[Any, int | None, Callable[[], Any]], Awaitable[ObservabilityHandle | None]]:
+    ) -> Callable[[Any, int | None, SnapshotReader], Awaitable[ObservabilityHandle | None]]:
         return self.start_observability or _default_start_observability
 
-    def resolved_build_snapshot(self) -> Callable[[OrchestratorState], Any]:
+    def resolved_build_snapshot(self) -> Callable[[Any], Any]:
         if self.build_snapshot is not None:
             return self.build_snapshot
         from symphony.observability.snapshot import build_snapshot
 
         return build_snapshot
 
+    def resolved_build_issue_detail(self) -> Callable[[Any, str], Any]:
+        if self.build_issue_detail is not None:
+            return self.build_issue_detail
+        from symphony.observability.snapshot import build_issue_detail
+
+        return build_issue_detail
+
 
 def _default_configure_logging() -> None:
     """Bring up the log sink (SPEC 13.2).
 
-    CONTRACTS.md names ``get_logger``/``StructuredLogger`` but no configuration
-    entry point, so ``configure_logging`` is called only if the observability
-    module actually defines it. The stderr fallback exists because SPEC 13.2
-    makes operator visibility of startup and validation failures a REQUIREMENT:
-    a missing or unconfigured sink must not be the reason nobody sees why the
-    service refused to boot.
+    ``symphony.observability.logging.configure`` installs the structured router.
+    The stderr fallback exists because SPEC 13.2 makes operator visibility of
+    startup and validation failures a REQUIREMENT: a missing or unconfigurable
+    sink must not be the reason nobody can see why the service refused to boot.
     """
     try:
         from symphony.observability import logging as observability_logging
@@ -253,11 +269,12 @@ def _default_configure_logging() -> None:
         _basic_stderr_logging()
         return
 
-    configure = getattr(observability_logging, "configure_logging", None)
-    if callable(configure):
-        configure()
-    else:
-        _basic_stderr_logging()
+    for name in ("configure", "configure_logging"):
+        entry = getattr(observability_logging, name, None)
+        if callable(entry):
+            entry()
+            return
+    _basic_stderr_logging()
 
 
 def _basic_stderr_logging() -> None:
@@ -270,23 +287,69 @@ def _basic_stderr_logging() -> None:
 async def _default_start_observability(
     config: Any,
     port_override: int | None,
-    snapshot: Callable[[], Any],
+    reader: SnapshotReader,
 ) -> ObservabilityHandle | None:
     """Start observability outputs (SPEC 16.1, 13.7).
 
     For this implementation the only *startable* output is the OPTIONAL HTTP
-    extension. It is enabled by a CLI ``--port`` argument or by ``server.port``
-    in the front matter, and the CLI value wins when both are present
-    (SPEC 13.7). Returning ``None`` means the extension is disabled, which is
-    the conformant default.
+    extension. Port precedence — CLI ``--port`` over ``server.port``, with ``0``
+    a real request for an ephemeral port rather than an absence — is applied by
+    ``symphony.http.server`` so that SPEC 13.7's rule has exactly one owner.
+    ``None`` back from ``build_http_server`` means the extension is not enabled,
+    which is the normal default and not an error.
     """
-    port = port_override if port_override is not None else getattr(config, "server_port", None)
-    if port is None:
+    from symphony.http.api import SnapshotSource
+    from symphony.http.server import build_http_server
+
+    server = build_http_server(
+        SnapshotSource(snapshot=reader.snapshot, issue_detail=reader.issue_detail),
+        cli_port=port_override,
+        config_port=getattr(config, "server_port", None),
+    )
+    if server is None:
         return None
+    await server.start()
+    return server
 
-    from symphony.http.server import start_server
 
-    return await start_server(port=port, snapshot=snapshot)
+def _default_build_orchestrator(config: Any, workflow: Any, tracker: Any) -> Orchestrator:
+    """Assemble the orchestrator and the collaborators its constructor requires.
+
+    The host is the only process-level assembler, so the workspace manager, hook
+    runner, and agent runner are built here even though their behavior belongs
+    to their own modules.
+
+    The agent runner reports SPEC 10.4 events to the orchestrator, and the
+    orchestrator needs the runner, so the event sink is bound late through a
+    closure rather than by constructing either one twice.
+    """
+    from symphony.agent.runner import AgentRunner
+    from symphony.orchestrator.core import Orchestrator as CoreOrchestrator
+    from symphony.workspace.hooks import HookRunner
+    from symphony.workspace.manager import WorkspaceManager
+
+    built: dict[str, Any] = {}
+
+    def on_event(issue_id: str, event: Any) -> None:
+        orchestrator = built.get("orchestrator")
+        if orchestrator is not None:
+            orchestrator.report_agent_event(issue_id, event)
+
+    hooks = HookRunner(config.hooks)
+    workspaces = WorkspaceManager(config.workspace_root, hooks)
+    runner = AgentRunner(
+        config=config,
+        workflow=workflow,
+        workspace_manager=workspaces,
+        hooks=hooks,
+        tracker=tracker,
+        on_event=on_event,
+    )
+    orchestrator = CoreOrchestrator(
+        config=config, tracker=tracker, runner=runner, workspaces=workspaces
+    )
+    built["orchestrator"] = orchestrator
+    return orchestrator
 
 
 # --------------------------------------------------------------------------
@@ -343,20 +406,19 @@ def install_signal_handlers(
       ``signal.signal`` and hops back onto the loop thread with
       ``call_soon_threadsafe`` — the C-level handler runs on whichever thread
       the interpreter chooses, and the shutdown flag must not be set from there.
-    * ``signal.signal`` is only legal on the main thread; a non-main-thread host
+    * ``signal.signal`` is legal only on the main thread; a non-main-thread host
       gets no handlers and is expected to call
       :meth:`ServiceHost.request_shutdown` itself.
     * The Windows ``ProactorEventLoop`` can park in a completion-port wait
       without executing Python bytecode, which is exactly when a pending
-      C-level SIGINT handler cannot run. The caller therefore also runs
-      :func:`_windows_signal_pump` to guarantee the interpreter regains control.
+      C-level handler cannot run. :meth:`ServiceHost.serve` therefore also runs
+      :func:`_windows_signal_pump` so the interpreter reliably regains control.
     * SIGBREAK (Ctrl+Break) exists only on Windows and is included there because
       it is the console signal that survives cases where SIGINT does not.
     """
-    names: list[str] = ["SIGINT", "SIGTERM", "SIGBREAK"]
     restores: list[Callable[[], None]] = []
 
-    for name in names:
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
         sig = getattr(signal, name, None)
         if sig is None:
             continue
@@ -411,9 +473,9 @@ async def _windows_signal_pump(interval: float = WINDOWS_SIGNAL_POLL_SECONDS) ->
 class ServiceHost:
     """A started Symphony service and everything the process must unwind.
 
-    Constructed unstarted so that late-bound collaborators (the snapshot
-    callable handed to observability before ``state`` exists) have a stable
-    object to read from.
+    Constructed unstarted so that the late-bound :class:`SnapshotReader` handed
+    to observability — before any orchestrator state exists — has a stable
+    object to resolve against.
     """
 
     def __init__(
@@ -429,8 +491,8 @@ class ServiceHost:
         self.deps = deps or HostDeps()
         self.grace_seconds = grace_seconds
 
+        self.workflow: Any = None
         self.config: Any = None
-        self.state: OrchestratorState | None = None
         self.orchestrator: Orchestrator | None = None
         self.tracker: Any = None
         self.watcher: Watcher | None = None
@@ -444,6 +506,15 @@ class ServiceHost:
         self._closed = False
         self._signal_count = 0
 
+    @property
+    def state(self) -> Any:
+        """The SPEC 4.1.8 runtime state, or ``None`` before the orchestrator exists.
+
+        Owned by the orchestrator (CONTRACTS.md gives it SPEC 16.1); the host
+        reads it for observability and for an RLM driver.
+        """
+        return None if self.orchestrator is None else self.orchestrator.state
+
     # -- SPEC 16.1 -------------------------------------------------------
 
     async def start(self) -> None:
@@ -456,12 +527,14 @@ class ServiceHost:
            access as ambient from its first line onward.
         3. ``start_observability_outputs()``
         4. ``start_workflow_watch(on_change=reload_and_reapply_workflow)``
-        5. build the SPEC 4.1.8 initial state
-        6. ``validate_dispatch_config()`` — **fatal on failure** (SPEC 6.3)
-        7. ``startup_terminal_workspace_cleanup()`` — warn on failure (SPEC 8.6)
+        5. ``validate_dispatch_config()`` — **fatal on failure** (SPEC 6.3)
+        6. build the tracker adapter and the orchestrator
+        7. ``orchestrator.start()`` — the SPEC 16.1 tail: preflight re-check,
+           SPEC 8.6 startup terminal workspace cleanup (a warning there, not a
+           startup failure), and ``schedule_tick(0)``
 
-        Steps 3 and 4 precede step 6 exactly as the spec orders them, so the
-        validation error in step 6 is emitted through an already-running
+        Steps 3 and 4 precede step 5 exactly as the spec orders them, so the
+        validation error in step 5 is emitted through an already-running
         observability surface (SPEC 13.2).
 
         Any failure unwinds whatever already started and re-raises; the caller
@@ -479,12 +552,14 @@ class ServiceHost:
             self.config = self._load_effective_config()
             await self._start_observability()
             await self._start_workflow_watch()
-            self.state = self._build_initial_state(self.config)
             self._validate_for_startup()
-            self.orchestrator = self.deps.resolved_build_orchestrator()(
-                self.config, self.state, self.tracker
+            self.tracker = self.deps.resolved_build_adapter()(
+                self.config.tracker_kind, self.config.tracker_provider
             )
-            await self._startup_terminal_workspace_cleanup()
+            self.orchestrator = self.deps.resolved_build_orchestrator()(
+                self.config, self.workflow, self.tracker
+            )
+            await self.orchestrator.start()
         except BaseException:
             await self.aclose()
             raise
@@ -492,9 +567,14 @@ class ServiceHost:
         self.log.info("service started", outcome="completed")
 
     def _load_effective_config(self) -> Any:
-        """SPEC 16.1 step 2. A load or build failure is fatal (SPEC 6.3, 14.1)."""
-        definition = self.deps.resolved_load_workflow()(self.workflow_path)
-        return self.deps.resolved_build_config()(definition)
+        """SPEC 16.1 step 2. A load or build failure is fatal (SPEC 6.3, 14.1).
+
+        The parsed :class:`~symphony.models.WorkflowDefinition` is retained, not
+        just the typed config: the agent runner renders the SPEC 5.4 prompt
+        template from it.
+        """
+        self.workflow = self.deps.resolved_load_workflow()(self.workflow_path)
+        return self.deps.resolved_build_config()(self.workflow)
 
     async def _start_observability(self) -> None:
         """SPEC 16.1 step 3.
@@ -504,9 +584,10 @@ class ServiceHost:
         orchestrator correctness, and SPEC 14.2 says dashboard failures do not
         crash the orchestrator.
         """
+        reader = SnapshotReader(snapshot=self.snapshot, issue_detail=self.issue_detail)
         try:
             self.observability = await self.deps.resolved_start_observability()(
-                self.config, self.port_override, self.snapshot
+                self.config, self.port_override, reader
             )
         except Exception as exc:
             self.log.error(
@@ -527,53 +608,21 @@ class ServiceHost:
 
     async def _start_workflow_watch(self) -> None:
         """SPEC 16.1 step 4 — ``start_workflow_watch(on_change=...)`` (SPEC 6.2)."""
-        self.watcher = self.deps.resolved_build_watcher()(
-            self.workflow_path, self.reload_workflow
-        )
+        self.watcher = self.deps.resolved_build_watcher()(self.workflow_path, self.reload_workflow)
         await self.watcher.start()
 
-    @staticmethod
-    def _build_initial_state(config: Any) -> OrchestratorState:
-        """SPEC 16.1 step 5 / SPEC 4.1.8. Remaining fields use their model defaults."""
-        return OrchestratorState(
-            poll_interval_ms=config.poll_interval_ms,
-            max_concurrent_agents=config.max_concurrent_agents,
-        )
-
     def _validate_for_startup(self) -> None:
-        """SPEC 16.1 step 6 — the one fatal validation in the whole service.
+        """SPEC 16.1 step 5 — the one fatal validation the host performs.
 
         SPEC 6.3 is explicit that a startup validation failure fails startup,
         while the identical check on a later tick only skips dispatch
-        (SPEC 14.2). Building the tracker adapter is part of the same check:
-        SPEC 6.3 requires that the selected adapter *accept*
-        ``tracker.provider`` after defaults and ``$VAR`` resolution, and the
-        only honest way to assert that is to construct it.
+        (SPEC 14.2). ``orchestrator.start()`` runs the same preflight again;
+        the duplication is deliberate and cheap. Checking here means a bad
+        config is rejected before four collaborators are constructed, and it
+        keeps the exit-code decision — which only the host can make — from
+        depending on orchestrator internals.
         """
         self.deps.resolved_validate_dispatch_config()(self.config)
-        self.tracker = self.deps.resolved_build_adapter()(
-            self.config.tracker_kind, self.config.tracker_provider
-        )
-
-    async def _startup_terminal_workspace_cleanup(self) -> None:
-        """SPEC 16.1 step 7 / SPEC 8.6 — runs before the first tick; warns on failure.
-
-        SPEC 8.6 step 3 makes the terminal-issue fetch failure a warning that
-        continues startup. Stale workspaces are an accumulation problem, not a
-        correctness one, so no failure mode here is worth refusing to boot over.
-        """
-        cleanup = getattr(self.orchestrator, "startup_terminal_workspace_cleanup", None)
-        if cleanup is None:
-            return
-        try:
-            await cleanup()
-        except Exception as exc:
-            self.log.warning(
-                "startup terminal workspace cleanup failed",
-                outcome="failed",
-                reason=_reason(exc),
-                category=_category(exc),
-            )
 
     # -- SPEC 6.2 --------------------------------------------------------
 
@@ -588,9 +637,11 @@ class ServiceHost:
         preflight, which skips dispatch and keeps reconciliation running
         (SPEC 6.3, 14.2).
         """
+        previous_workflow = self.workflow
         try:
             config = self._load_effective_config()
         except Exception as exc:
+            self.workflow = previous_workflow
             self.log.error(
                 "workflow reload failed; keeping last known good config",
                 outcome="failed",
@@ -606,7 +657,7 @@ class ServiceHost:
             return
 
         try:
-            await self.orchestrator.reload(config)
+            await self.orchestrator.apply_config(config)
         except Exception as exc:
             self.log.error(
                 "workflow reload could not be applied to live behavior",
@@ -618,17 +669,27 @@ class ServiceHost:
 
         self.log.info("workflow reloaded", outcome="completed")
 
-    # -- run / shutdown --------------------------------------------------
+    # -- observability reads (SPEC 13.3, 13.7.2) -------------------------
 
     def snapshot(self) -> Any:
-        """Current runtime snapshot (SPEC 13.3), or ``None`` before state exists."""
-        if self.state is None:
+        """Current runtime snapshot, or ``None`` before the orchestrator exists."""
+        return self._read(lambda state: self.deps.resolved_build_snapshot()(state))
+
+    def issue_detail(self, identifier: str) -> Any:
+        """Per-issue detail, or ``None`` before the orchestrator exists."""
+        return self._read(lambda state: self.deps.resolved_build_issue_detail()(state, identifier))
+
+    def _read(self, fn: Callable[[Any], Any]) -> Any:
+        state = self.state
+        if state is None:
             return None
         try:
-            return self.deps.resolved_build_snapshot()(self.state)
+            return fn(state)
         except Exception:
             # SPEC 14.2: observability failures never propagate into the host.
             return None
+
+    # -- run / shutdown --------------------------------------------------
 
     def request_shutdown(self, reason: str) -> None:
         """Ask the host to stop. Idempotent; safe from a signal callback.
@@ -660,16 +721,14 @@ class ServiceHost:
         if sys.platform == "win32":
             pump = asyncio.ensure_future(_windows_signal_pump())
 
-        run_task: asyncio.Task[None] = asyncio.ensure_future(self.orchestrator.run())
+        run_task: asyncio.Task[None] = asyncio.ensure_future(self.orchestrator.run_forever())
         stop_task: asyncio.Task[bool] = asyncio.ensure_future(self._shutdown.wait())
 
         try:
             await asyncio.wait({run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
 
             if run_task.done():
-                stop_task.cancel()
-                # Re-raise the orchestrator's exception, if any.
-                run_task.result()
+                run_task.result()  # re-raise the orchestrator's exception, if any
                 raise RuntimeError("orchestrator run loop exited without a shutdown request")
 
             self.log.info("shutdown requested", reason=self.shutdown_reason or "unknown")
@@ -736,6 +795,7 @@ class ServiceHost:
             return
         self._closed = True
 
+        await self._close_quietly("orchestrator", getattr(self.orchestrator, "stop", None))
         await self._close_quietly("tracker adapter", getattr(self.tracker, "aclose", None))
         await self._close_quietly("workflow watch", getattr(self.watcher, "stop", None))
         await self._close_quietly(
@@ -755,7 +815,7 @@ class ServiceHost:
 
 
 async def start_service(
-    workflow_path: str | Path | None = None,
+    workflow_path: str | os.PathLike[str] | None = None,
     *,
     port: int | None = None,
     deps: HostDeps | None = None,
@@ -764,7 +824,7 @@ async def start_service(
     """Run the SPEC 16.1 startup sequence and return the live host.
 
     This is the seam the module docstring promises an RLM: it performs every
-    startup step, leaves the service running, and hands back an object whose
+    startup step, leaves the service ticking, and hands back an object whose
     ``config``, ``state``, and ``orchestrator`` are directly inspectable. The
     caller owns the returned host and must ``await host.aclose()``.
 
@@ -817,9 +877,7 @@ async def _amain(
     grace_seconds: float,
 ) -> int:
     try:
-        host = await start_service(
-            workflow_path, port=port, deps=deps, grace_seconds=grace_seconds
-        )
+        host = await start_service(workflow_path, port=port, deps=deps, grace_seconds=grace_seconds)
     except Exception as exc:
         _report_startup_failure(exc)
         return EXIT_STARTUP_FAILURE
@@ -852,12 +910,10 @@ def run(
     :func:`start_service` when you already have a running event loop.
     """
     try:
-        return asyncio.run(
-            _amain(workflow_path, port=port, deps=deps, grace_seconds=grace_seconds)
-        )
+        return asyncio.run(_amain(workflow_path, port=port, deps=deps, grace_seconds=grace_seconds))
     except KeyboardInterrupt:
-        # A SIGINT that beat the handler into place, or one raised on Windows
-        # between loop iterations. Operator-requested stop, so still success.
+        # A SIGINT that beat the handler into place, or one delivered between
+        # loop iterations. Operator-requested stop, so still success.
         return EXIT_OK
 
 
